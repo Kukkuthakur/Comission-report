@@ -1,6 +1,6 @@
 """
 Commission Report Builder — Streamlit app
-Upload a flat Excel file (.xls/.xlsx), get a formatted commission report.
+Handles real .xls/.xlsx AND HTML tables masquerading as .xls.
 """
 import io
 import re
@@ -42,6 +42,10 @@ HEADERS    = ["S.No", "Date", "Patient Name", "Investigation Done",
 COL_WIDTHS = [6, 12, 18, 30, 12, 11, 10, 11, 10]
 
 # ---------------- helpers ----------------
+def is_html_bytes(b: bytes) -> bool:
+    head = b[:1024].lstrip().lower()
+    return head.startswith(b"<") or b"<html" in head or b"<table" in head
+
 def clean_money(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return 0.0
@@ -66,9 +70,26 @@ def compute_rate(cut, disc, amb):
     return max(cut - disc - a, 0.0)
 
 # ---------------- load ----------------
-def load_source(file_like, filename):
-    engine = "xlrd" if filename.lower().endswith(".xls") else "openpyxl"
-    df = pd.read_excel(file_like, engine=engine)
+def load_source(raw_bytes, filename):
+    if isinstance(raw_bytes, str):
+        raw_bytes = raw_bytes.encode("utf-8", errors="ignore")
+
+    if is_html_bytes(raw_bytes):
+        try:
+            tables = pd.read_html(io.BytesIO(raw_bytes))
+        except Exception as e:
+            raise ValueError(f"Could not parse HTML table: {e}")
+        if not tables:
+            raise ValueError("No <table> found in the HTML file.")
+        df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+    else:
+        engine = "xlrd" if filename.lower().endswith(".xls") else "openpyxl"
+        try:
+            df = pd.read_excel(io.BytesIO(raw_bytes), engine=engine)
+        except Exception:
+            alt = "openpyxl" if engine == "xlrd" else "xlrd"
+            df = pd.read_excel(io.BytesIO(raw_bytes), engine=alt)
+
     df.columns = [str(c).strip() for c in df.columns]
 
     required = ["PatientName", "BillDate", "ReferBy", "TestName",
@@ -286,7 +307,7 @@ uploaded = st.file_uploader("Choose your Excel file", type=["xls", "xlsx"])
 if uploaded is not None:
     if st.button("Generate Report", type="primary"):
         try:
-            df = load_source(io.BytesIO(uploaded.read()), uploaded.name)
+            df = load_source(uploaded.read(), uploaded.name)
         except Exception as e:
             st.error(f"Could not read file: {e}")
             st.stop()
@@ -336,4 +357,3 @@ if uploaded is not None:
 
 st.divider()
 st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.") 
-
