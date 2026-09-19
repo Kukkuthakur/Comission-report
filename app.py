@@ -1,4 +1,4 @@
-"""
+ """
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 """
@@ -344,83 +344,105 @@ st.markdown(
     "DiscPercent · CutRate · Ambulance`"
 )
 
+# --- persistent state ---
+if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
+if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
+if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
+if "summary"     not in st.session_state: st.session_state.summary     = None
+
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
 st.subheader("Option 1 — Upload")
 uploaded = st.file_uploader("Choose your Excel file",
                             type=["xls", "xlsx", "html", "htm"])
+if uploaded is not None:
+    st.session_state.raw_bytes   = uploaded.read()
+    st.session_state.source_name = uploaded.name
+    st.session_state.report_buf  = None
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
 drive_input = st.text_input("Drive / Sheets link or file ID", value="")
 
-raw_bytes = None
-source_name = "source.xls"
+if st.button("Fetch from Drive"):
+    if not drive_input.strip():
+        st.error("Paste a link first.")
+    else:
+        with st.spinner("Downloading from Google…"):
+            try:
+                st.session_state.raw_bytes   = fetch_from_gdrive(drive_input)
+                st.session_state.source_name = "drive_file.xls"
+                st.session_state.report_buf  = None
+                st.success("File fetched successfully.")
+            except Exception as e:
+                st.error(f"Drive fetch failed: {e}")
 
-if uploaded is not None:
-    raw_bytes = uploaded.read()
-    source_name = uploaded.name
-
-if raw_bytes is None and drive_input.strip():
-    if st.button("Fetch from Drive and Generate", type="primary"):
-        try:
-            raw_bytes = fetch_from_gdrive(drive_input)
-            source_name = "drive_file.xls"
-        except Exception as e:
-            st.error(f"Drive fetch failed: {e}")
-            st.stop()
-
-if raw_bytes is not None:
+# --- generate ---
+if st.session_state.raw_bytes is not None:
+    st.info(f"Loaded file: {st.session_state.source_name} "
+            f"({len(st.session_state.raw_bytes):,} bytes)")
     if st.button("Generate Report", type="primary"):
-        try:
-            df = load_source(raw_bytes, source_name)
-        except Exception as e:
-            st.error(f"Could not read file: {e}")
-            st.stop()
+        with st.spinner("Building report…"):
+            try:
+                df = load_source(st.session_state.raw_bytes,
+                                 st.session_state.source_name)
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+                st.stop()
 
-        if df.empty:
-            st.warning("No rows found after cleaning. Check your file.")
-            st.stop()
+            if df.empty:
+                st.warning("No rows found after cleaning. Check your file.")
+                st.stop()
 
-        st.success(f"Loaded **{len(df)}** rows across "
-                   f"**{df['ReferBy'].nunique()}** referrers.")
+            ref_groups = sorted(
+                df.groupby("ReferBy", sort=False),
+                key=lambda x: x[1]["Rate"].sum(),
+                reverse=True,
+            )
+            packed = pack_referrers(ref_groups)
 
-        ref_groups = sorted(
-            df.groupby("ReferBy", sort=False),
-            key=lambda x: x[1]["Rate"].sum(),
-            reverse=True,
-        )
-        packed = pack_referrers(ref_groups)
+            packed_names = {n for _, group in packed for n, _ in group}
+            expected = {n for n, _ in ref_groups}
+            if packed_names != expected:
+                st.error("Internal error: some referrers were dropped during packing.")
+                st.stop()
 
-        packed_names = {n for _, group in packed for n, _ in group}
-        expected = {n for n, _ in ref_groups}
-        if packed_names != expected:
-            st.error("Internal error: some referrers were dropped during packing.")
-            st.stop()
+            wb = build_workbook(df, ref_groups, packed, period_text)
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
 
-        wb = build_workbook(df, ref_groups, packed, period_text)
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
+            st.session_state.report_buf = buf.getvalue()
+            st.session_state.summary = {
+                "rows": int(len(df)),
+                "referrers": int(df["ReferBy"].nunique()),
+                "total_rate": float(df["Rate"].sum()),
+                "top": [
+                    (n, len(g), float(g["Rate"].sum()))
+                    for n, g in ref_groups[:15]
+                ],
+            }
 
-        total_rate = df["Rate"].sum()
-        st.metric("Grand total Rate (₹)", f"{total_rate:,.0f}")
+# --- results ---
+if st.session_state.report_buf is not None:
+    s = st.session_state.summary
+    st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers.")
+    st.metric("Grand total Rate (₹)", f"{s['total_rate']:,.0f}")
 
-        st.download_button(
-            label="⬇️ Download report (.xlsx)",
-            data=buf.getvalue(),
-            file_name="Commission_Report_Output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+    st.download_button(
+        label="⬇️ Download report (.xlsx)",
+        data=st.session_state.report_buf,
+        file_name="Commission_Report_Output.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
-        with st.expander("Preview referrers (top 15 by total Rate)"):
-            preview = pd.DataFrame({
-                "Referrer": [n for n, _ in ref_groups[:15]],
-                "Line Items": [len(g) for _, g in ref_groups[:15]],
-                "Total Rate (₹)": [float(g["Rate"].sum()) for _, g in ref_groups[:15]],
-            })
-            preview["Total Rate (₹)"] = preview["Total Rate (₹)"].map(lambda x: f"{x:,.0f}")
-            st.dataframe(preview, hide_index=True, use_container_width=True)
+    with st.expander("Preview referrers (top 15 by total Rate)"):
+        preview = pd.DataFrame({
+            "Referrer": [r for r, _, _ in s["top"]],
+            "Line Items": [n for _, n, _ in s["top"]],
+            "Total Rate (₹)": [f"{t:,.0f}" for _, _, t in s["top"]],
+        })
+        st.dataframe(preview, hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.") 
+st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.")
