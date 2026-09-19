@@ -16,7 +16,7 @@ DEFAULT_PERIOD = "September 2026"
 ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
 XL_THRESHOLD   = 20
-EXPECTED_TOTAL = 172400  # set to 0 to disable the total check
+EXPECTED_TOTAL = 172400  # set to 0 to disable
 
 # ---------- statement styling ----------
 FONT_TITLE   = Font(name="Calibri", size=14, bold=True)
@@ -49,13 +49,11 @@ LONG_TEST_CHARS = 25
 _SPACE_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[.,]+$")
 
-def normalize_referrer(name: str) -> str:
+def normalize_referrer(name):
     s = str(name).strip()
     s = _SPACE_RE.sub(" ", s)
     s = _PUNCT_RE.sub("", s)
-    if s.isupper() or s.islower():
-        s = s.title()
-    return s
+    return s.upper()          # ← ALL CAPS
 
 
 def is_html_bytes(b):
@@ -147,7 +145,6 @@ def load_source(raw_bytes, filename="file.xls"):
         if c in df.columns:
             df = df.drop(columns=[c])
 
-    # ---- drop TOTAL / junk rows ----
     referby_str = df["ReferBy"].astype(str).str.strip().str.upper()
     df = df[~referby_str.isin(["TOTAL", "GRAND TOTAL", "SUM", ""])]
 
@@ -155,7 +152,6 @@ def load_source(raw_bytes, filename="file.xls"):
         refno_str = df["RefNo"].astype(str).str.strip()
         df = df[~refno_str.isin(["", "nan", "TOTAL"])]
 
-    # ---- normalize referrer names ----
     df["ReferBy"] = df["ReferBy"].astype(str).apply(normalize_referrer)
 
     for c in ["PatientRate", "DiscPercent", "CutRate", "Ambulance"]:
@@ -164,7 +160,6 @@ def load_source(raw_bytes, filename="file.xls"):
     df["PatientName"] = df["PatientName"].astype(str).str.strip()
     df["TestName"]    = df["TestName"].astype(str).str.strip()
 
-    # ---- sort by date within each referrer ----
     df["_date"] = df["BillDate"].apply(parse_date)
     df = df.sort_values(by=["ReferBy", "_date"], kind="stable").reset_index(drop=True)
     df["BillDate"] = df["_date"].apply(
@@ -254,89 +249,137 @@ def pack_referrers(ref_groups):
     return sheets
 
 
+# ------------------------------------------------------------------
+# INDEX — 3 side-by-side tables in portrait, bigger fonts
+# ------------------------------------------------------------------
 def write_index(ws, ref_groups, sheet_map, period_text):
-    """Compact index sheet — fits on a single A4 portrait page."""
-    FONT_IDX_TITLE  = Font(name="Calibri", size=13, bold=True)
-    FONT_IDX_HEADER = Font(name="Calibri", size=9, bold=True, color="FFFFFF")
-    FONT_IDX_BODY   = Font(name="Calibri", size=8)
-    FONT_IDX_TOTAL  = Font(name="Calibri", size=9, bold=True)
-    FONT_IDX_LINK   = Font(name="Calibri", size=8, color="0563C1", underline="single")
+    """Three stacked-column tables: col-blocks (A-D), (F-I), (K-N)."""
+    FONT_IDX_TITLE  = Font(name="Calibri", size=14, bold=True)
+    FONT_IDX_HEADER = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+    FONT_IDX_BODY   = Font(name="Calibri", size=10)
+    FONT_IDX_TOTAL  = Font(name="Calibri", size=10, bold=True)
+    FONT_IDX_LINK   = Font(name="Calibri", size=10, color="0563C1", underline="single")
 
+    # Title spans all 3 tables
     ws["A1"] = f"Commission Report Index — {period_text}"
     ws["A1"].font = FONT_IDX_TITLE
-    ws.merge_cells("A1:D1")
-    ws.row_dimensions[1].height = 18
+    ws.merge_cells("A1:N1")
+    ws.row_dimensions[1].height = 20
 
-    for i, h in enumerate(["Referrer", "Lines", "Total Rate (₹)", "Go"], 1):
-        c = ws.cell(row=2, column=i, value=h)
-        c.font = FONT_IDX_HEADER
-        c.fill = FILL_HEADER
-        c.alignment = CENTER
-        c.border = BORDER
-    ws.row_dimensions[2].height = 14
+    # Column layouts for the 3 tables (start col for each)
+    # Table 1: A B C D   | gap E
+    # Table 2: F G H I   | gap J
+    # Table 3: K L M N
+    table_starts = [1, 6, 11]
+    col_widths = {
+        1: 26, 2: 7, 3: 11, 4: 5,   # table 1
+        5: 2,                       # gap
+        6: 26, 7: 7, 8: 11, 9: 5,   # table 2
+        10: 2,                      # gap
+        11: 26, 12: 7, 13: 11, 14: 5,  # table 3
+    }
+    for c, w in col_widths.items():
+        ws.column_dimensions[get_column_letter(c)].width = w
 
-    row = 3
+    # Split referrers into 3 roughly equal groups
+    n = len(ref_groups)
+    per_col = (n + 2) // 3   # ceil division → max rows per table
+    columns = [ref_groups[0:per_col],
+               ref_groups[per_col:2*per_col],
+               ref_groups[2*per_col:3*per_col]]
+
+    header_row = 2
+    start_row = 3
+
     grand_total = 0.0
     grand_items = 0
-    for name, g in ref_groups:
-        sn, fr = sheet_map[name]
 
-        c = ws.cell(row=row, column=1, value=name)
-        c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = LEFT
+    for tbl_idx, (start_col, group) in enumerate(zip(table_starts, columns)):
+        # Header row
+        for i, h in enumerate(["Referrer", "Lines", "Rate (₹)", "Go"]):
+            c = ws.cell(row=header_row, column=start_col + i, value=h)
+            c.font = FONT_IDX_HEADER
+            c.fill = FILL_HEADER
+            c.alignment = CENTER
+            c.border = BORDER
+        ws.row_dimensions[header_row].height = 15
 
-        c = ws.cell(row=row, column=2, value=len(g))
-        c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = CENTER
+        # Body rows
+        r = start_row
+        for name, g in group:
+            sn, fr = sheet_map[name]
 
-        c = ws.cell(row=row, column=3, value=float(g["Rate"].sum()))
-        c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = RIGHT
+            c = ws.cell(row=r, column=start_col, value=name)
+            c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = LEFT
+
+            c = ws.cell(row=r, column=start_col + 1, value=len(g))
+            c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = CENTER
+
+            c = ws.cell(row=r, column=start_col + 2, value=float(g["Rate"].sum()))
+            c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = RIGHT
+            c.number_format = "#,##0"
+
+            link = ws.cell(row=r, column=start_col + 3, value="►")
+            link.hyperlink = f"#'{sn}'!A{fr}"
+            link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
+
+            ws.row_dimensions[r].height = 14
+            grand_total += float(g["Rate"].sum())
+            grand_items += len(g)
+            r += 1
+
+        # Per-column subtotal row (nice to have)
+        c = ws.cell(row=r, column=start_col, value="SUBTOTAL")
+        c.font = FONT_IDX_TOTAL; c.fill = FILL_TOTAL
+        c.border = BORDER; c.alignment = LEFT
+
+        c = ws.cell(row=r, column=start_col + 1,
+                    value=sum(len(g) for _, g in group))
+        c.font = FONT_IDX_TOTAL; c.fill = FILL_TOTAL
+        c.border = BORDER; c.alignment = CENTER
+
+        c = ws.cell(row=r, column=start_col + 2,
+                    value=sum(float(g["Rate"].sum()) for _, g in group))
+        c.font = FONT_IDX_TOTAL; c.fill = FILL_TOTAL
+        c.border = BORDER; c.alignment = RIGHT
         c.number_format = "#,##0"
 
-        link = ws.cell(row=row, column=4, value="►")
-        link.hyperlink = f"#'{sn}'!A{fr}"
-        link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
+        c = ws.cell(row=r, column=start_col + 3)
+        c.fill = FILL_TOTAL; c.border = BORDER
 
-        ws.row_dimensions[row].height = 12
-        grand_total += float(g["Rate"].sum())
-        grand_items += len(g)
-        row += 1
-
-    ws.cell(row=row, column=1, value="GRAND TOTAL")
-    ws.cell(row=row, column=2, value=grand_items)
-    c = ws.cell(row=row, column=3, value=grand_total)
+    # Grand total row across all three tables
+    last_row = start_row + per_col + 1
+    ws.cell(row=last_row + 1, column=1, value="GRAND TOTAL")
+    ws.cell(row=last_row + 1, column=2, value=grand_items)
+    c = ws.cell(row=last_row + 1, column=3, value=grand_total)
     c.number_format = "#,##0"
     for j in range(1, 5):
-        cc = ws.cell(row=row, column=j)
+        cc = ws.cell(row=last_row + 1, column=j)
         cc.font = FONT_IDX_TOTAL
         cc.fill = FILL_TOTAL
         cc.border = BORDER
         cc.alignment = CENTER if j in (2, 4) else (LEFT if j == 1 else RIGHT)
-    ws.row_dimensions[row].height = 14
-
-    ws.column_dimensions["A"].width = 32
-    ws.column_dimensions["B"].width = 7
-    ws.column_dimensions["C"].width = 13
-    ws.column_dimensions["D"].width = 5
+    ws.row_dimensions[last_row + 1].height = 16
 
     ws.freeze_panes = "A3"
 
-    # Print: portrait A4, single page, tight margins
+    # Print: portrait A4, single page
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 1
     ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.page_margins.left = 0.4
-    ws.page_margins.right = 0.4
+    ws.page_margins.left = 0.35
+    ws.page_margins.right = 0.35
     ws.page_margins.top = 0.5
     ws.page_margins.bottom = 0.5
     ws.print_options.horizontalCentered = True
-    ws.print_area = f"A1:D{row}"
+    ws.print_area = f"A1:N{last_row + 1}"
 
 
 def write_block(ws, start_row, referrer, df, period_text):
     r = start_row
 
-    # Header row: Referrer name (left) + Thanks & Regards (right)
     ws.cell(row=r, column=1, value=referrer)
     ws.cell(row=r, column=1).font = FONT_REF
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
@@ -393,7 +436,6 @@ def write_block(ws, start_row, referrer, df, period_text):
                 c.number_format = "#,##0"
         r += 1
 
-    # Total row: ONLY Rate column gets a value
     ws.cell(row=r, column=1, value="Total")
     ws.cell(row=r, column=9, value=float(df["Rate"].sum()))
     for j in range(1, 10):
@@ -429,7 +471,6 @@ def build_workbook(df, ref_groups, packed, period_text):
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.print_options.horizontalCentered = True
 
-        # Print titles ONLY for single-block XL sheets
         if len(group) == 1:
             ws.print_title_rows = "1:3"
 
@@ -545,8 +586,7 @@ if st.session_state.report_buf is not None:
             st.info(f"✔ Total matches source TOTAL row (₹{s['expected']:,}).")
         else:
             st.warning(f"⚠️ Computed total differs from source TOTAL "
-                       f"(₹{s['expected']:,}) by ₹{diff:+,.0f}. "
-                       f"Check for filter rules or missing rows.")
+                       f"(₹{s['expected']:,}) by ₹{diff:+,.0f}.")
 
     st.download_button(
         label="⬇️ Download report (.xlsx)",
