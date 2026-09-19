@@ -94,11 +94,39 @@ def load_source(raw_bytes, filename="file.xls"):
 
     df.columns = [str(c).strip() for c in df.columns]
 
+    # ---- column alias mapping ----
+    # App expects canonical names; source file uses different labels.
+    # Order matters: the first existing alias wins.
+    aliases = {
+        "PatientName": ["PatientName", "Patient Name"],
+        "BillDate":    ["BillDate", "Bill Date", "Date"],
+        "ReferBy":     ["ReferBy", "Refer By", "Referrer"],
+        "TestName":    ["TestName", "Test Name", "Investigation"],
+        "PatientRate": ["PatientRate", "Patient Rate", "Charge",
+                        "Investigation Charge"],
+        "DiscPercent": ["DiscPercent", "Disc", "Discount"],
+        "CutRate":     ["CutRate", "PercentCut", "Percent Cut"],
+        "Ambulance":   ["Ambulance", "Ambulance Charge"],
+    }
+    rename = {}
+    for canonical, options in aliases.items():
+        for opt in options:
+            if opt in df.columns and opt != canonical:
+                rename[opt] = canonical
+                break
+    if rename:
+        df = df.rename(columns=rename)
+
     required = ["PatientName", "BillDate", "ReferBy", "TestName",
                 "PatientRate", "DiscPercent", "CutRate", "Ambulance"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
+
+    # Drop source-provided Rate/Profit so we don't collide with our computed Rate
+    for c in ["Rate", "Profit"]:
+        if c in df.columns:
+            df = df.drop(columns=[c])
 
     for c in ["PatientRate", "DiscPercent", "CutRate", "Ambulance"]:
         df[c] = df[c].apply(clean_money)
@@ -332,9 +360,9 @@ st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
 st.markdown(
-    "**Required columns in the source file:**  \n"
+    "**Expected columns in the source file:**  \n"
     "`PatientName · BillDate · ReferBy · TestName · PatientRate · "
-    "DiscPercent · CutRate · Ambulance`"
+    "Disc · PercentCut · Ambulance`"
 )
 
 if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
@@ -435,4 +463,4 @@ if st.session_state.report_buf is not None:
         st.dataframe(preview, hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.")
+st.caption("Rate = PercentCut − Disc − Ambulance (ambulance only when 100), floored at 0.")
