@@ -1,6 +1,7 @@
 """
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx AND HTML tables masquerading as .xls.
+Supports upload OR Google Drive link.
 """
 import io
 import re
@@ -70,7 +71,7 @@ def compute_rate(cut, disc, amb):
     return max(cut - disc - a, 0.0)
 
 # ---------------- load ----------------
-def load_source(raw_bytes, filename):
+def load_source(raw_bytes, filename="file.xls"):
     if isinstance(raw_bytes, str):
         raw_bytes = raw_bytes.encode("utf-8", errors="ignore")
 
@@ -115,6 +116,20 @@ def load_source(raw_bytes, filename):
         axis=1,
     )
     return df.reset_index(drop=True)
+
+# ---------------- gdrive fetch ----------------
+def fetch_from_gdrive(file_id):
+    """Download a public Google Drive file by ID and return its bytes."""
+    import gdown
+    url = f"https://drive.google.com/uc?id={file_id}"
+    buf = io.BytesIO()
+    gdown.download(url, buf, quiet=True, fuzzy=True)
+    buf.seek(0)
+    data = buf.read()
+    if not data:
+        raise ValueError("Drive download returned empty. "
+                         "Check the file is shared as 'Anyone with the link'.")
+    return data
 
 # ---------------- packing ----------------
 def pack_referrers(ref_groups):
@@ -291,8 +306,8 @@ st.set_page_config(page_title="Commission Report Builder",
                    page_icon="📊", layout="centered")
 
 st.title("📊 Commission Report Builder")
-st.caption("Upload a flat Excel file (.xls or .xlsx). You'll get back a formatted "
-           "commission report with an index sheet and per-referrer statements.")
+st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
+           "from an upload or a Google Drive link.")
 
 st.markdown(
     "**Required columns in the source file:**  \n"
@@ -302,12 +317,48 @@ st.markdown(
 
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
-uploaded = st.file_uploader("Choose your Excel file", type=["xls", "xlsx"])
+st.subheader("Option 1 — Upload")
+uploaded = st.file_uploader("Choose your Excel file", type=["xls", "xlsx", "html", "htm"])
+
+st.subheader("Option 2 — Google Drive link")
+st.caption("Share the file as 'Anyone with the link', then paste either "
+           "the full link or just the file ID.")
+drive_input = st.text_input("Drive link or file ID", value="")
+
+def _extract_drive_id(s: str) -> str:
+    s = s.strip()
+    if not s:
+        return ""
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", s)
+    if m:
+        return m.group(1)
+    return s  # assume raw ID
+
+raw_bytes = None
+source_name = "source.xls"
 
 if uploaded is not None:
+    raw_bytes = uploaded.read()
+    source_name = uploaded.name
+elif drive_input.strip():
+    if st.button("Fetch from Drive and Generate", type="primary"):
+        try:
+            fid = _extract_drive_id(drive_input)
+            raw_bytes = fetch_from_gdrive(fid)
+            source_name = "drive_file.xls"
+        except Exception as e:
+            st.error(f"Drive fetch failed: {e}")
+            st.stop()
+    else:
+        raw_bytes = None
+
+if raw_bytes is not None:
     if st.button("Generate Report", type="primary"):
         try:
-            df = load_source(uploaded.read(), uploaded.name)
+            df = load_source(raw_bytes, source_name)
         except Exception as e:
             st.error(f"Could not read file: {e}")
             st.stop()
@@ -356,4 +407,4 @@ if uploaded is not None:
             st.dataframe(preview, hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.") 
+st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.")
