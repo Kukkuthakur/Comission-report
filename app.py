@@ -1,10 +1,10 @@
 """
 Commission Report Builder — Streamlit app
-Handles real .xls/.xlsx AND HTML tables masquerading as .xls.
-Supports upload OR Google Drive link.
+Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 """
 import io
 import re
+import urllib.request
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
@@ -117,18 +117,47 @@ def load_source(raw_bytes, filename="file.xls"):
     )
     return df.reset_index(drop=True)
 
-# ---------------- gdrive fetch ----------------
-def fetch_from_gdrive(file_id):
-    """Download a public Google Drive file by ID and return its bytes."""
-    import gdown
-    url = f"https://drive.google.com/uc?id={file_id}"
-    buf = io.BytesIO()
-    gdown.download(url, buf, quiet=True, fuzzy=True)
-    buf.seek(0)
-    data = buf.read()
-    if not data:
-        raise ValueError("Drive download returned empty. "
-                         "Check the file is shared as 'Anyone with the link'.")
+# ---------------- gdrive / sheets fetch ----------------
+def fetch_from_gdrive(url_or_id):
+    """
+    Fetch bytes from:
+      - a Drive file link (drive.google.com/file/d/ID/view)
+      - a Sheets edit link (docs.google.com/spreadsheets/d/ID/edit)
+      - a raw file ID
+    """
+    s = url_or_id.strip()
+    if not s:
+        raise ValueError("Empty link.")
+
+    fid = None
+    for pat in (r"/file/d/([A-Za-z0-9_-]+)",
+                r"/spreadsheets/d/([A-Za-z0-9_-]+)",
+                r"[?&]id=([A-Za-z0-9_-]+)"):
+        m = re.search(pat, s)
+        if m:
+            fid = m.group(1)
+            break
+    if not fid:
+        fid = s  # assume raw ID
+
+    if "docs.google.com/spreadsheets" in s or "/spreadsheets/" in s:
+        export_url = f"https://docs.google.com/spreadsheets/d/{fid}/export?format=xlsx"
+    else:
+        export_url = f"https://drive.google.com/uc?export=download&id={fid}"
+
+    req = urllib.request.Request(export_url,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = r.read()
+    except Exception as e:
+        raise ValueError(f"Fetch failed: {e}")
+
+    if not data or len(data) < 100:
+        raise ValueError(
+            "Downloaded file is empty or too small. "
+            "Make sure the file is shared as 'Anyone with the link'."
+        )
     return data
 
 # ---------------- packing ----------------
@@ -307,7 +336,7 @@ st.set_page_config(page_title="Commission Report Builder",
 
 st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
-           "from an upload or a Google Drive link.")
+           "from an upload or a Google Drive / Sheets link.")
 
 st.markdown(
     "**Required columns in the source file:**  \n"
@@ -318,24 +347,12 @@ st.markdown(
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
 st.subheader("Option 1 — Upload")
-uploaded = st.file_uploader("Choose your Excel file", type=["xls", "xlsx", "html", "htm"])
+uploaded = st.file_uploader("Choose your Excel file",
+                            type=["xls", "xlsx", "html", "htm"])
 
-st.subheader("Option 2 — Google Drive link")
-st.caption("Share the file as 'Anyone with the link', then paste either "
-           "the full link or just the file ID.")
-drive_input = st.text_input("Drive link or file ID", value="")
-
-def _extract_drive_id(s: str) -> str:
-    s = s.strip()
-    if not s:
-        return ""
-    m = re.search(r"/d/([A-Za-z0-9_-]+)", s)
-    if m:
-        return m.group(1)
-    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", s)
-    if m:
-        return m.group(1)
-    return s  # assume raw ID
+st.subheader("Option 2 — Google Drive / Sheets link")
+st.caption("Share the file as 'Anyone with the link', then paste the link here.")
+drive_input = st.text_input("Drive / Sheets link or file ID", value="")
 
 raw_bytes = None
 source_name = "source.xls"
@@ -343,17 +360,15 @@ source_name = "source.xls"
 if uploaded is not None:
     raw_bytes = uploaded.read()
     source_name = uploaded.name
-elif drive_input.strip():
+
+if raw_bytes is None and drive_input.strip():
     if st.button("Fetch from Drive and Generate", type="primary"):
         try:
-            fid = _extract_drive_id(drive_input)
-            raw_bytes = fetch_from_gdrive(fid)
+            raw_bytes = fetch_from_gdrive(drive_input)
             source_name = "drive_file.xls"
         except Exception as e:
             st.error(f"Drive fetch failed: {e}")
             st.stop()
-    else:
-        raw_bytes = None
 
 if raw_bytes is not None:
     if st.button("Generate Report", type="primary"):
@@ -367,7 +382,8 @@ if raw_bytes is not None:
             st.warning("No rows found after cleaning. Check your file.")
             st.stop()
 
-        st.success(f"Loaded **{len(df)}** rows across **{df['ReferBy'].nunique()}** referrers.")
+        st.success(f"Loaded **{len(df)}** rows across "
+                   f"**{df['ReferBy'].nunique()}** referrers.")
 
         ref_groups = sorted(
             df.groupby("ReferBy", sort=False),
@@ -407,4 +423,4 @@ if raw_bytes is not None:
             st.dataframe(preview, hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.")
+st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.") 
