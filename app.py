@@ -21,6 +21,7 @@ FONT_REF     = Font(name="Calibri", size=12, bold=True)
 FONT_PERIOD  = Font(name="Calibri", size=10, italic=True)
 FONT_HEADER  = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
 FONT_BODY    = Font(name="Calibri", size=10)
+FONT_BODY_SM = Font(name="Calibri", size=8)
 FONT_TOTAL   = Font(name="Calibri", size=10, bold=True)
 FONT_THANKS  = Font(name="Calibri", size=9, italic=True)
 
@@ -39,6 +40,8 @@ HEADERS    = ["S.No", "Date", "Patient Name", "Investigation Done",
               "Investigation Charge", "Ambulance", "Discount",
               "Percent Cut", "Rate"]
 COL_WIDTHS = [6, 12, 18, 30, 12, 11, 10, 11, 10]
+
+LONG_TEST_CHARS = 25  # shrink font when TestName longer than this
 
 
 def is_html_bytes(b):
@@ -94,9 +97,6 @@ def load_source(raw_bytes, filename="file.xls"):
 
     df.columns = [str(c).strip() for c in df.columns]
 
-    # ---- column alias mapping ----
-    # App expects canonical names; source file uses different labels.
-    # Order matters: the first existing alias wins.
     aliases = {
         "PatientName": ["PatientName", "Patient Name"],
         "BillDate":    ["BillDate", "Bill Date", "Date"],
@@ -123,7 +123,6 @@ def load_source(raw_bytes, filename="file.xls"):
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
 
-    # Drop source-provided Rate/Profit so we don't collide with our computed Rate
     for c in ["Rate", "Profit"]:
         if c in df.columns:
             df = df.drop(columns=[c])
@@ -253,21 +252,35 @@ def write_index(ws, ref_groups, sheet_map, period_text):
 
 
 def write_block(ws, start_row, referrer, df, period_text):
+    """
+    Writes one referrer block.
+    Returns (next_row, header_row_for_print_titles).
+    """
     r = start_row
 
+    # --- Row 1: Referrer name (left) + Thanks & Regards (right) ---
     ws.cell(row=r, column=1, value=referrer)
     ws.cell(row=r, column=1).font = FONT_REF
-    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
+    # merge A:? for name (say A:F = cols 1..6)
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+    # merge G:I for thanks (cols 7..9)
+    ws.cell(row=r, column=7, value="Thanks & Regards")
+    ws.cell(row=r, column=7).font = FONT_THANKS
+    ws.cell(row=r, column=7).alignment = RIGHT
+    ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=9)
     for c in range(1, 10):
         ws.cell(row=r, column=c).fill = FILL_REF
         ws.cell(row=r, column=c).border = BORDER
     r += 1
 
+    # --- Row 2: Period ---
     ws.cell(row=r, column=1, value=period_text)
     ws.cell(row=r, column=1).font = FONT_PERIOD
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
     r += 1
 
+    # --- Row 3: Column headers ---
+    header_row = r
     for i, h in enumerate(HEADERS, 1):
         c = ws.cell(row=r, column=i, value=h)
         c.font = FONT_HEADER
@@ -276,14 +289,20 @@ def write_block(ws, start_row, referrer, df, period_text):
         c.border = BORDER
     r += 1
 
+    # --- Body ---
     for i, (_, row) in enumerate(df.iterrows(), 1):
         amb = row["Ambulance"]
-        amb_disp = amb if amb == 100 else ""
+        # Negative display for ambulance of 100
+        amb_disp = -100 if amb == 100 else ""
+
+        test_name = str(row["TestName"])
+        test_font = FONT_BODY_SM if len(test_name) > LONG_TEST_CHARS else FONT_BODY
+
         vals = [
             i,
             row["BillDate"],
             row["PatientName"],
-            row["TestName"],
+            test_name,
             row["PatientRate"],
             amb_disp,
             row["DiscPercent"],
@@ -292,7 +311,7 @@ def write_block(ws, start_row, referrer, df, period_text):
         ]
         for j, v in enumerate(vals, 1):
             c = ws.cell(row=r, column=j, value=v)
-            c.font = FONT_BODY
+            c.font = test_font if j == 4 else FONT_BODY
             c.border = BORDER
             c.alignment = (
                 CENTER if j in (1, 2, 6)
@@ -303,28 +322,24 @@ def write_block(ws, start_row, referrer, df, period_text):
                 c.number_format = "#,##0"
         r += 1
 
-    totals = [
-        "Total", "", "", "",
-        float(df["PatientRate"].sum()),
-        float(df.loc[df["Ambulance"] == 100, "Ambulance"].sum()),
-        float(df["DiscPercent"].sum()),
-        float(df["CutRate"].sum()),
-        float(df["Rate"].sum()),
-    ]
-    for j, v in enumerate(totals, 1):
-        c = ws.cell(row=r, column=j, value=v)
+    # --- Total row: ONLY Rate column gets a value ---
+    # Put label in first column, blank for the rest, value only in Rate (col 9)
+    ws.cell(row=r, column=1, value="Total")
+    ws.cell(row=r, column=9, value=float(df["Rate"].sum()))
+    for j in range(1, 10):
+        c = ws.cell(row=r, column=j)
         c.font = FONT_TOTAL
         c.fill = FILL_TOTAL
         c.border = BORDER
         c.alignment = CENTER if j == 1 else RIGHT
-        if j >= 5:
+        if j == 9:
             c.number_format = "#,##0"
     r += 1
 
     ws.cell(row=r, column=1, value="Thanks & Regards")
     ws.cell(row=r, column=1).font = FONT_THANKS
     r += 2
-    return r, start_row
+    return r, header_row
 
 
 def build_workbook(df, ref_groups, packed, period_text):
@@ -344,9 +359,17 @@ def build_workbook(df, ref_groups, packed, period_text):
         ws.print_options.horizontalCentered = True
 
         row = 1
+        first_header_row = None
         for referrer, g in group:
-            row, fr = write_block(ws, row, referrer, g, period_text)
-            sheet_map[referrer] = (sn, fr)
+            row, hr = write_block(ws, row, referrer, g, period_text)
+            sheet_map[referrer] = (sn, hr - 2)   # block starts 2 rows above header
+            if first_header_row is None:
+                first_header_row = hr
+
+        # Print title rows: repeat the doctor's name row + period + header row
+        # on every printed page. We use rows 1..(first_header_row) as titles.
+        if first_header_row:
+            ws.print_title_rows = f"1:{first_header_row}"
 
     write_index(idx, ref_groups, sheet_map, period_text)
     return wb
