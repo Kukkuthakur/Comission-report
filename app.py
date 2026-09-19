@@ -11,10 +11,10 @@ from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
 # ---------------- config ----------------
-PERIOD_TEXT = "September 2026"
-ROWS_PER_PAGE = 38
+DEFAULT_PERIOD = "September 2026"
+ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
-XL_THRESHOLD = 20
+XL_THRESHOLD   = 20
 
 # ---------------- styling ----------------
 FONT_TITLE   = Font(name="Calibri", size=14, bold=True)
@@ -29,16 +29,16 @@ FILL_HEADER  = PatternFill("solid", fgColor="305496")
 FILL_TOTAL   = PatternFill("solid", fgColor="D9E1F2")
 FILL_REF     = PatternFill("solid", fgColor="FCE4D6")
 
-THIN = Side(style="thin", color="B0B0B0")
+THIN   = Side(style="thin", color="B0B0B0")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT   = Alignment(horizontal="left",   vertical="center", wrap_text=True)
 RIGHT  = Alignment(horizontal="right",  vertical="center")
 
-HEADERS = ["S.No", "Date", "Patient Name", "Investigation Done",
-           "Investigation Charge", "Ambulance", "Discount",
-           "Percent Cut", "Rate"]
+HEADERS    = ["S.No", "Date", "Patient Name", "Investigation Done",
+              "Investigation Charge", "Ambulance", "Discount",
+              "Percent Cut", "Rate"]
 COL_WIDTHS = [6, 12, 18, 30, 12, 11, 10, 11, 10]
 
 # ---------------- helpers ----------------
@@ -134,8 +134,8 @@ def pack_referrers(ref_groups):
     return sheets
 
 # ---------------- writers ----------------
-def write_index(ws, ref_groups, sheet_map):
-    ws["A1"] = f"Commission Report Index — {PERIOD_TEXT}"
+def write_index(ws, ref_groups, sheet_map, period_text):
+    ws["A1"] = f"Commission Report Index — {period_text}"
     ws["A1"].font = FONT_TITLE
     ws.merge_cells("A1:D1")
 
@@ -167,7 +167,7 @@ def write_index(ws, ref_groups, sheet_map):
     ws.column_dimensions["D"].width = 18
     ws.freeze_panes = "A4"
 
-def write_block(ws, start_row, referrer, df):
+def write_block(ws, start_row, referrer, df, period_text):
     r = start_row
 
     ws.cell(row=r, column=1, value=referrer)
@@ -178,7 +178,7 @@ def write_block(ws, start_row, referrer, df):
         ws.cell(row=r, column=c).border = BORDER
     r += 1
 
-    ws.cell(row=r, column=1, value=PERIOD_TEXT)
+    ws.cell(row=r, column=1, value=period_text)
     ws.cell(row=r, column=1).font = FONT_PERIOD
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
     r += 1
@@ -241,7 +241,7 @@ def write_block(ws, start_row, referrer, df):
     r += 2
     return r, start_row
 
-def build_workbook(df, ref_groups, packed):
+def build_workbook(df, ref_groups, packed, period_text):
     wb = Workbook()
     wb.remove(wb.active)
     idx = wb.create_sheet("Index")
@@ -259,14 +259,15 @@ def build_workbook(df, ref_groups, packed):
 
         row = 1
         for referrer, g in group:
-            row, fr = write_block(ws, row, referrer, g)
+            row, fr = write_block(ws, row, referrer, g, period_text)
             sheet_map[referrer] = (sn, fr)
 
-    write_index(idx, ref_groups, sheet_map)
-    return wb, sheet_map
+    write_index(idx, ref_groups, sheet_map, period_text)
+    return wb
 
 # ---------------- streamlit UI ----------------
-st.set_page_config(page_title="Commission Report Builder", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Commission Report Builder",
+                   page_icon="📊", layout="centered")
 
 st.title("📊 Commission Report Builder")
 st.caption("Upload a flat Excel file (.xls or .xlsx). You'll get back a formatted "
@@ -278,14 +279,12 @@ st.markdown(
     "DiscPercent · CutRate · Ambulance`"
 )
 
-period = st.text_input("Report period", value=PERIOD_TEXT)
+period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
 uploaded = st.file_uploader("Choose your Excel file", type=["xls", "xlsx"])
 
 if uploaded is not None:
     if st.button("Generate Report", type="primary"):
-        global PERIOD_TEXT
-        PERIOD_TEXT = period
         try:
             df = load_source(io.BytesIO(uploaded.read()), uploaded.name)
         except Exception as e:
@@ -311,7 +310,7 @@ if uploaded is not None:
             st.error("Internal error: some referrers were dropped during packing.")
             st.stop()
 
-        wb, _ = build_workbook(df, ref_groups, packed)
+        wb = build_workbook(df, ref_groups, packed, period_text)
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
@@ -319,11 +318,10 @@ if uploaded is not None:
         total_rate = df["Rate"].sum()
         st.metric("Grand total Rate (₹)", f"{total_rate:,.0f}")
 
-        out_name = "Commission_Report_Output.xlsx"
         st.download_button(
             label="⬇️ Download report (.xlsx)",
             data=buf.getvalue(),
-            file_name=out_name,
+            file_name="Commission_Report_Output.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
@@ -337,4 +335,5 @@ if uploaded is not None:
             st.dataframe(preview, hide_index=True, use_container_width=True)
 
 st.divider()
-st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.")
+st.caption("Rate = CutRate − Discount − Ambulance (ambulance only when 100), floored at 0.") 
+
