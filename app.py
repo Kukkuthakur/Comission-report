@@ -1,6 +1,8 @@
 """
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
+
+v2: adds per-referrer individual statement download (single-sheet workbook).
 """
 import io
 import re
@@ -260,30 +262,24 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     FONT_IDX_TOTAL  = Font(name="Calibri", size=10, bold=True)
     FONT_IDX_LINK   = Font(name="Calibri", size=10, color="0563C1", underline="single")
 
-    # Title spans all 3 tables
     ws["A1"] = f"Commission Report Index — {period_text}"
     ws["A1"].font = FONT_IDX_TITLE
     ws.merge_cells("A1:N1")
     ws.row_dimensions[1].height = 20
 
-    # Column layouts for the 3 tables (start col for each)
-    # Table 1: A B C D   | gap E
-    # Table 2: F G H I   | gap J
-    # Table 3: K L M N
     table_starts = [1, 6, 11]
     col_widths = {
-        1: 26, 2: 7, 3: 11, 4: 5,   # table 1
-        5: 2,                       # gap
-        6: 26, 7: 7, 8: 11, 9: 5,   # table 2
-        10: 2,                      # gap
-        11: 26, 12: 7, 13: 11, 14: 5,  # table 3
+        1: 26, 2: 7, 3: 11, 4: 5,
+        5: 2,
+        6: 26, 7: 7, 8: 11, 9: 5,
+        10: 2,
+        11: 26, 12: 7, 13: 11, 14: 5,
     }
     for c, w in col_widths.items():
         ws.column_dimensions[get_column_letter(c)].width = w
 
-    # Split referrers into 3 roughly equal groups
     n = len(ref_groups)
-    per_col = (n + 2) // 3   # ceil division → max rows per table
+    per_col = (n + 2) // 3
     columns = [ref_groups[0:per_col],
                ref_groups[per_col:2*per_col],
                ref_groups[2*per_col:3*per_col]]
@@ -295,7 +291,6 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     grand_items = 0
 
     for tbl_idx, (start_col, group) in enumerate(zip(table_starts, columns)):
-        # Header row
         for i, h in enumerate(["Referrer", "Lines", "Rate (₹)", "Go"]):
             c = ws.cell(row=header_row, column=start_col + i, value=h)
             c.font = FONT_IDX_HEADER
@@ -304,7 +299,6 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             c.border = BORDER
         ws.row_dimensions[header_row].height = 15
 
-        # Body rows
         r = start_row
         for name, g in group:
             sn, fr = sheet_map[name]
@@ -328,7 +322,6 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             grand_items += len(g)
             r += 1
 
-        # Per-column subtotal row (nice to have)
         c = ws.cell(row=r, column=start_col, value="SUBTOTAL")
         c.font = FONT_IDX_TOTAL; c.fill = FILL_TOTAL
         c.border = BORDER; c.alignment = LEFT
@@ -347,7 +340,6 @@ def write_index(ws, ref_groups, sheet_map, period_text):
         c = ws.cell(row=r, column=start_col + 3)
         c.fill = FILL_TOTAL; c.border = BORDER
 
-    # Grand total row across all three tables
     last_row = start_row + per_col + 1
     ws.cell(row=last_row + 1, column=1, value="GRAND TOTAL")
     ws.cell(row=last_row + 1, column=2, value=grand_items)
@@ -363,7 +355,6 @@ def write_index(ws, ref_groups, sheet_map, period_text):
 
     ws.freeze_panes = "A3"
 
-    # Print: portrait A4, single page
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
@@ -487,6 +478,27 @@ def build_workbook(df, ref_groups, packed, period_text):
     return wb
 
 
+def build_individual_workbook(referrer, df_one, period_text):
+    """Single-sheet workbook: one referrer's statement, sheet named after the referrer."""
+    wb = Workbook()
+    ws = wb.active
+    # Excel sheet-name limit: 31 chars, no []:*?/\
+    safe_name = re.sub(r"[\[\]:*?/\\]", "-", str(referrer))[:31]
+    ws.title = safe_name or "Statement"
+
+    for i, w in enumerate(COL_WIDTHS, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    ws.page_setup.orientation = "portrait"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    ws.print_options.horizontalCentered = True
+    ws.print_title_rows = "1:3"
+
+    write_block(ws, 1, referrer, df_one, period_text)
+    return wb
+
+
 # ---------------- streamlit UI ----------------
 st.set_page_config(page_title="Commission Report Builder",
                    page_icon="📊", layout="centered")
@@ -495,10 +507,11 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
-if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
-if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
-if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
-if "summary"     not in st.session_state: st.session_state.summary     = None
+if "raw_bytes"        not in st.session_state: st.session_state.raw_bytes        = None
+if "source_name"      not in st.session_state: st.session_state.source_name      = "source.xls"
+if "report_buf"       not in st.session_state: st.session_state.report_buf       = None
+if "summary"          not in st.session_state: st.session_state.summary          = None
+if "df_cache"         not in st.session_state: st.session_state.df_cache         = None
 
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
@@ -509,6 +522,7 @@ if uploaded is not None:
     st.session_state.raw_bytes   = uploaded.read()
     st.session_state.source_name = uploaded.name
     st.session_state.report_buf  = None
+    st.session_state.df_cache    = None
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
@@ -523,6 +537,7 @@ if st.button("Fetch from Drive"):
                 st.session_state.raw_bytes   = fetch_from_gdrive(drive_input)
                 st.session_state.source_name = "drive_file.xls"
                 st.session_state.report_buf  = None
+                st.session_state.df_cache    = None
                 st.success("File fetched successfully.")
             except Exception as e:
                 st.error(f"Drive fetch failed: {e}")
@@ -564,6 +579,7 @@ if st.session_state.raw_bytes is not None:
             computed_total = float(df["Rate"].sum())
 
             st.session_state.report_buf = buf.getvalue()
+            st.session_state.df_cache   = df
             st.session_state.summary = {
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
@@ -575,6 +591,7 @@ if st.session_state.raw_bytes is not None:
                 ],
             }
 
+# ---------------- combined report download ----------------
 if st.session_state.report_buf is not None:
     s = st.session_state.summary
     st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers.")
@@ -589,7 +606,7 @@ if st.session_state.report_buf is not None:
                        f"(₹{s['expected']:,}) by ₹{diff:+,.0f}.")
 
     st.download_button(
-        label="⬇️ Download report (.xlsx)",
+        label="⬇️ Download combined report (.xlsx)",
         data=st.session_state.report_buf,
         file_name="Commission_Report_Output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -602,6 +619,54 @@ if st.session_state.report_buf is not None:
             "Total Rate (₹)": [f"{t:,.0f}" for _, _, t in s["top"]],
         })
         st.dataframe(preview, hide_index=True, use_container_width=True)
+
+# ---------------- individual referrer download ----------------
+if st.session_state.df_cache is not None:
+    st.divider()
+    st.subheader("Individual Referrer Statement")
+    st.caption("Pick a referrer to download a single-sheet XLSX containing only "
+               "that referrer's statement, in the same layout as the combined report.")
+
+    df = st.session_state.df_cache
+    referrer_list = sorted(df["ReferBy"].unique().tolist())
+
+    selected = st.selectbox(
+        "Search / select referrer",
+        options=referrer_list,
+        index=None,
+        placeholder="Type to search…",
+    )
+
+    if selected:
+        df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
+
+        # small preview
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Line items", f"{len(df_one):,}")
+        with col2:
+            st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
+
+        with st.expander("Preview rows"):
+            st.dataframe(
+                df_one[["BillDate", "PatientName", "TestName",
+                        "PatientRate", "DiscPercent", "CutRate", "Rate"]],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+        wb_one = build_individual_workbook(selected, df_one, period_text)
+        buf_one = io.BytesIO()
+        wb_one.save(buf_one)
+        buf_one.seek(0)
+
+        safe_fname = re.sub(r"[^A-Za-z0-9._-]", "_", selected)[:60]
+        st.download_button(
+            label=f"⬇️ Download statement for {selected} (.xlsx)",
+            data=buf_one.getvalue(),
+            file_name=f"{safe_fname}_Commission_Statement.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 st.divider()
 st.caption("Rate = PercentCut − Disc − Ambulance (ambulance only when 100), floored at 0.")
