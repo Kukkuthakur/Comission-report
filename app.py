@@ -2,7 +2,8 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v2: adds per-referrer individual statement download (single-sheet workbook).
+v3: fixes individual referrer statement download — controlled selectbox with
+    session-state key, explicit download-button keys, empty guard.
 """
 import io
 import re
@@ -507,11 +508,13 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
+# --- session state ---
 if "raw_bytes"        not in st.session_state: st.session_state.raw_bytes        = None
 if "source_name"      not in st.session_state: st.session_state.source_name      = "source.xls"
 if "report_buf"       not in st.session_state: st.session_state.report_buf       = None
 if "summary"          not in st.session_state: st.session_state.summary          = None
 if "df_cache"         not in st.session_state: st.session_state.df_cache         = None
+if "referrer_select"  not in st.session_state: st.session_state.referrer_select  = None
 
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
@@ -523,6 +526,7 @@ if uploaded is not None:
     st.session_state.source_name = uploaded.name
     st.session_state.report_buf  = None
     st.session_state.df_cache    = None
+    st.session_state.referrer_select = None
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
@@ -538,6 +542,7 @@ if st.button("Fetch from Drive"):
                 st.session_state.source_name = "drive_file.xls"
                 st.session_state.report_buf  = None
                 st.session_state.df_cache    = None
+                st.session_state.referrer_select = None
                 st.success("File fetched successfully.")
             except Exception as e:
                 st.error(f"Drive fetch failed: {e}")
@@ -580,6 +585,8 @@ if st.session_state.raw_bytes is not None:
 
             st.session_state.report_buf = buf.getvalue()
             st.session_state.df_cache   = df
+            # reset individual-referrer selection for the new dataset
+            st.session_state.referrer_select = None
             st.session_state.summary = {
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
@@ -610,6 +617,7 @@ if st.session_state.report_buf is not None:
         data=st.session_state.report_buf,
         file_name="Commission_Report_Output.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_combined_report",
     )
 
     with st.expander("Preview referrers (top 15 by total Rate)"):
@@ -630,43 +638,54 @@ if st.session_state.df_cache is not None:
     df = st.session_state.df_cache
     referrer_list = sorted(df["ReferBy"].unique().tolist())
 
+    # --- controlled selectbox: persists selection across reruns ---
+    if (st.session_state.referrer_select not in referrer_list):
+        # initialize (or re-initialize after new data) to the first referrer
+        st.session_state.referrer_select = referrer_list[0] if referrer_list else None
+
     selected = st.selectbox(
         "Search / select referrer",
         options=referrer_list,
-        index=None,
-        placeholder="Type to search…",
+        index=(referrer_list.index(st.session_state.referrer_select)
+               if st.session_state.referrer_select in referrer_list else 0),
+        key="referrer_select_widget",
     )
+    # mirror the widget value back into our stable session key
+    st.session_state.referrer_select = selected
 
     if selected:
         df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
 
-        # small preview
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Line items", f"{len(df_one):,}")
-        with col2:
-            st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
+        if df_one.empty:
+            st.warning(f"No rows found for {selected}.")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Line items", f"{len(df_one):,}")
+            with col2:
+                st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
 
-        with st.expander("Preview rows"):
-            st.dataframe(
-                df_one[["BillDate", "PatientName", "TestName",
-                        "PatientRate", "DiscPercent", "CutRate", "Rate"]],
-                hide_index=True,
-                use_container_width=True,
+            with st.expander("Preview rows"):
+                st.dataframe(
+                    df_one[["BillDate", "PatientName", "TestName",
+                            "PatientRate", "DiscPercent", "CutRate", "Rate"]],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+
+            wb_one = build_individual_workbook(selected, df_one, period_text)
+            buf_one = io.BytesIO()
+            wb_one.save(buf_one)
+            buf_one.seek(0)
+
+            safe_fname = re.sub(r"[^A-Za-z0-9._-]", "_", selected)[:60]
+            st.download_button(
+                label=f"⬇️ Download statement for {selected} (.xlsx)",
+                data=buf_one.getvalue(),
+                file_name=f"{safe_fname}_Commission_Statement.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"download_individual_{safe_fname}",
             )
-
-        wb_one = build_individual_workbook(selected, df_one, period_text)
-        buf_one = io.BytesIO()
-        wb_one.save(buf_one)
-        buf_one.seek(0)
-
-        safe_fname = re.sub(r"[^A-Za-z0-9._-]", "_", selected)[:60]
-        st.download_button(
-            label=f"⬇️ Download statement for {selected} (.xlsx)",
-            data=buf_one.getvalue(),
-            file_name=f"{safe_fname}_Commission_Statement.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
 
 st.divider()
 st.caption("Rate = PercentCut − Disc − Ambulance (ambulance only when 100), floored at 0.")
