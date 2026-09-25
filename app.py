@@ -2,8 +2,8 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v3: fixes individual referrer statement download — controlled selectbox with
-    session-state key, explicit download-button keys, empty guard.
+v4: fixes individual referrer selection freeze. Uses a single session-state
+    key for the referrer selectbox (no mirroring, no index= fallback).
 """
 import io
 import re
@@ -509,12 +509,12 @@ st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
 # --- session state ---
-if "raw_bytes"        not in st.session_state: st.session_state.raw_bytes        = None
-if "source_name"      not in st.session_state: st.session_state.source_name      = "source.xls"
-if "report_buf"       not in st.session_state: st.session_state.report_buf       = None
-if "summary"          not in st.session_state: st.session_state.summary          = None
-if "df_cache"         not in st.session_state: st.session_state.df_cache         = None
-if "referrer_select"  not in st.session_state: st.session_state.referrer_select  = None
+if "raw_bytes"       not in st.session_state: st.session_state.raw_bytes       = None
+if "source_name"     not in st.session_state: st.session_state.source_name     = "source.xls"
+if "report_buf"      not in st.session_state: st.session_state.report_buf      = None
+if "summary"         not in st.session_state: st.session_state.summary         = None
+if "df_cache"        not in st.session_state: st.session_state.df_cache        = None
+if "referrer_pick"   not in st.session_state: st.session_state.referrer_pick   = None
 
 period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
 
@@ -522,11 +522,11 @@ st.subheader("Option 1 — Upload")
 uploaded = st.file_uploader("Choose your Excel file",
                             type=["xls", "xlsx", "html", "htm"])
 if uploaded is not None:
-    st.session_state.raw_bytes   = uploaded.read()
-    st.session_state.source_name = uploaded.name
-    st.session_state.report_buf  = None
-    st.session_state.df_cache    = None
-    st.session_state.referrer_select = None
+    st.session_state.raw_bytes     = uploaded.read()
+    st.session_state.source_name   = uploaded.name
+    st.session_state.report_buf    = None
+    st.session_state.df_cache      = None
+    st.session_state.referrer_pick = None
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
@@ -538,11 +538,11 @@ if st.button("Fetch from Drive"):
     else:
         with st.spinner("Downloading from Google…"):
             try:
-                st.session_state.raw_bytes   = fetch_from_gdrive(drive_input)
-                st.session_state.source_name = "drive_file.xls"
-                st.session_state.report_buf  = None
-                st.session_state.df_cache    = None
-                st.session_state.referrer_select = None
+                st.session_state.raw_bytes     = fetch_from_gdrive(drive_input)
+                st.session_state.source_name   = "drive_file.xls"
+                st.session_state.report_buf    = None
+                st.session_state.df_cache      = None
+                st.session_state.referrer_pick = None
                 st.success("File fetched successfully.")
             except Exception as e:
                 st.error(f"Drive fetch failed: {e}")
@@ -583,10 +583,9 @@ if st.session_state.raw_bytes is not None:
 
             computed_total = float(df["Rate"].sum())
 
-            st.session_state.report_buf = buf.getvalue()
-            st.session_state.df_cache   = df
-            # reset individual-referrer selection for the new dataset
-            st.session_state.referrer_select = None
+            st.session_state.report_buf    = buf.getvalue()
+            st.session_state.df_cache      = df
+            st.session_state.referrer_pick = None   # reset for the new dataset
             st.session_state.summary = {
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
@@ -638,20 +637,18 @@ if st.session_state.df_cache is not None:
     df = st.session_state.df_cache
     referrer_list = sorted(df["ReferBy"].unique().tolist())
 
-    # --- controlled selectbox: persists selection across reruns ---
-    if (st.session_state.referrer_select not in referrer_list):
-        # initialize (or re-initialize after new data) to the first referrer
-        st.session_state.referrer_select = referrer_list[0] if referrer_list else None
+    # Initialize / validate the single source-of-truth session key.
+    # If the currently stored value isn't in the fresh list (e.g. after loading
+    # a new file), reset it to the first referrer alphabetically.
+    if (st.session_state.referrer_pick is None
+            or st.session_state.referrer_pick not in referrer_list):
+        st.session_state.referrer_pick = referrer_list[0] if referrer_list else None
 
     selected = st.selectbox(
         "Search / select referrer",
         options=referrer_list,
-        index=(referrer_list.index(st.session_state.referrer_select)
-               if st.session_state.referrer_select in referrer_list else 0),
-        key="referrer_select_widget",
+        key="referrer_pick",
     )
-    # mirror the widget value back into our stable session key
-    st.session_state.referrer_select = selected
 
     if selected:
         df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
