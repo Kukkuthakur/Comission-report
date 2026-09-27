@@ -639,27 +639,25 @@ if st.session_state.df_cache is not None:
     if not referrer_list:
         st.warning("No referrers available in the loaded data.")
     else:
-        # ------------------------------------------------------------------
-        # Dataset fingerprint — reset the widget ONLY when the data changes.
-        # The fingerprint must be cheap and stable across reruns of the same
-        # dataset, and different across different datasets.
-        # ------------------------------------------------------------------
+        # --------------------------------------------------------------
+        # Dataset fingerprint: ONLY things that are guaranteed stable
+        # across reruns of the same dataset.
+        # --------------------------------------------------------------
         dataset_id = (
             st.session_state.get("source_name", ""),
-            len(referrer_list),
-            tuple(referrer_list[:3]),
-            tuple(referrer_list[-3:]),
+            int(len(df)),
         )
 
+        # Only reset the widget when the DATASET changes — not on every
+        # rerun, and not when the user just picks a different referrer.
         if st.session_state.get("_referrer_dataset_id") != dataset_id:
-            # New dataset: drop the widget key so Streamlit re-inits at index 0.
             st.session_state.pop("referrer_pick", None)
+            st.session_state.pop("referrer_search_query", None)
             st.session_state["_referrer_dataset_id"] = dataset_id
 
-        # Optional search box that filters the dropdown.
+        # Optional search box.
         query = st.text_input(
             "Search referrer (optional)",
-            value="",
             key="referrer_search_query",
         ).strip().upper()
 
@@ -668,16 +666,21 @@ if st.session_state.df_cache is not None:
         if not filtered:
             st.warning("No referrer matches your search.")
         else:
-            # If the stored value isn't in the (possibly filtered) options,
-            # clear it so the selectbox falls back to index 0 cleanly.
+            # ----------------------------------------------------------
+            # Compute the index ourselves. Never pop the widget key just
+            # because the value isn't in `filtered` — that causes the
+            # refresh-back-to-first-doctor symptom.
+            # ----------------------------------------------------------
             current = st.session_state.get("referrer_pick")
-            if current is not None and current not in filtered:
-                st.session_state.pop("referrer_pick", None)
+            if current in filtered:
+                idx = filtered.index(current)
+            else:
+                idx = 0
 
             selected = st.selectbox(
                 "Select referrer",
                 options=filtered,
-                index=0,
+                index=idx,
                 key="referrer_pick",
             )
 
