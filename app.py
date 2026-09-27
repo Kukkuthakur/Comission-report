@@ -2,11 +2,18 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v6: fixes individual referrer selection freeze for good, using a dataset
-    fingerprint. The selectbox widget OWNS its session-state key — we never
-    manually assign to it. We only `pop` it when the underlying dataset
-    changes (tracked via a stable fingerprint), which lets Streamlit
-    re-initialize it cleanly at index 0.
+v7: individual-referrer section rewritten to be bulletproof against the
+    "page resets when I pick a doctor" symptom. Key points:
+
+      * The selectbox widget OWNS its session-state key.
+      * We NEVER assign to it directly.
+      * We ONLY reset it (pop the key) when the underlying dataset changes,
+        detected via a small, stable fingerprint: (source_name, len(df)).
+      * When the widget's stored value isn't in the current option list,
+        we compute the correct index ourselves instead of popping the key.
+        Popping on filter mismatch is what caused Streamlit to treat the
+        widget as brand-new on every rerun and re-initialize at index 0.
+      * No `value=` + `key=` conflicts on the search text_input.
 """
 import io
 import re
@@ -503,7 +510,10 @@ def build_individual_workbook(referrer, df_one, period_text):
     return wb
 
 
-# ---------------- streamlit UI ----------------
+# ============================================================
+#                     STREAMLIT UI
+# ============================================================
+
 st.set_page_config(page_title="Commission Report Builder",
                    page_icon="📊", layout="centered")
 
@@ -511,29 +521,38 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
-# --- session state (non-widget keys only) ---
+# --- non-widget session state ---
 if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
 if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
 if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
 if "summary"     not in st.session_state: st.session_state.summary     = None
 if "df_cache"    not in st.session_state: st.session_state.df_cache    = None
 
-period_text = st.text_input("Report period", value=DEFAULT_PERIOD)
+period_text = st.text_input("Report period", value=DEFAULT_PERIOD,
+                            key="period_text_input")
 
 st.subheader("Option 1 — Upload")
 uploaded = st.file_uploader("Choose your Excel file",
-                            type=["xls", "xlsx", "html", "htm"])
+                            type=["xls", "xlsx", "html", "htm"],
+                            key="file_uploader_widget")
 if uploaded is not None:
-    st.session_state.raw_bytes   = uploaded.read()
-    st.session_state.source_name = uploaded.name
-    st.session_state.report_buf  = None
-    st.session_state.df_cache    = None
+    # Only re-read if the file identity actually changed — prevents
+    # df_cache from being wiped on every rerun.
+    new_bytes = uploaded.read()
+    if new_bytes != st.session_state.raw_bytes:
+        st.session_state.raw_bytes   = new_bytes
+        st.session_state.source_name = uploaded.name
+        st.session_state.report_buf  = None
+        st.session_state.df_cache    = None
+        # Force a dataset-identity change so the referrer widget resets.
+        st.session_state.pop("_referrer_dataset_id", None)
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
-drive_input = st.text_input("Drive / Sheets link or file ID", value="")
+drive_input = st.text_input("Drive / Sheets link or file ID", value="",
+                            key="drive_link_input")
 
-if st.button("Fetch from Drive"):
+if st.button("Fetch from Drive", key="fetch_drive_btn"):
     if not drive_input.strip():
         st.error("Paste a link first.")
     else:
@@ -543,6 +562,7 @@ if st.button("Fetch from Drive"):
                 st.session_state.source_name = "drive_file.xls"
                 st.session_state.report_buf  = None
                 st.session_state.df_cache    = None
+                st.session_state.pop("_referrer_dataset_id", None)
                 st.success("File fetched successfully.")
             except Exception as e:
                 st.error(f"Drive fetch failed: {e}")
@@ -550,7 +570,7 @@ if st.button("Fetch from Drive"):
 if st.session_state.raw_bytes is not None:
     st.info(f"Loaded file: {st.session_state.source_name} "
             f"({len(st.session_state.raw_bytes):,} bytes)")
-    if st.button("Generate Report", type="primary"):
+    if st.button("Generate Report", type="primary", key="generate_report_btn"):
         with st.spinner("Building report…"):
             try:
                 df = load_source(st.session_state.raw_bytes,
@@ -595,6 +615,8 @@ if st.session_state.raw_bytes is not None:
                     for n, g in ref_groups[:15]
                 ],
             }
+            # Force the referrer widget to reset for the new dataset.
+            st.session_state.pop("_referrer_dataset_id", None)
 
 # ---------------- combined report download ----------------
 if st.session_state.report_buf is not None:
@@ -639,23 +661,20 @@ if st.session_state.df_cache is not None:
     if not referrer_list:
         st.warning("No referrers available in the loaded data.")
     else:
-        # --------------------------------------------------------------
-        # Dataset fingerprint: ONLY things that are guaranteed stable
-        # across reruns of the same dataset.
-        # --------------------------------------------------------------
+        # Stable dataset fingerprint — only (source_name, len(df)).
+        # Never includes referrer names, since those can reorder.
         dataset_id = (
             st.session_state.get("source_name", ""),
             int(len(df)),
         )
 
-        # Only reset the widget when the DATASET changes — not on every
-        # rerun, and not when the user just picks a different referrer.
+        # Reset the widget ONLY when the dataset identity changes.
         if st.session_state.get("_referrer_dataset_id") != dataset_id:
             st.session_state.pop("referrer_pick", None)
             st.session_state.pop("referrer_search_query", None)
             st.session_state["_referrer_dataset_id"] = dataset_id
 
-        # Optional search box.
+        # Search box — no `value=` alongside `key=`, to avoid state fights.
         query = st.text_input(
             "Search referrer (optional)",
             key="referrer_search_query",
@@ -666,16 +685,11 @@ if st.session_state.df_cache is not None:
         if not filtered:
             st.warning("No referrer matches your search.")
         else:
-            # ----------------------------------------------------------
-            # Compute the index ourselves. Never pop the widget key just
-            # because the value isn't in `filtered` — that causes the
-            # refresh-back-to-first-doctor symptom.
-            # ----------------------------------------------------------
+            # Compute the index ourselves. NEVER pop the widget key just
+            # because the current value isn't in `filtered` — that is what
+            # made Streamlit treat the widget as brand-new on every rerun.
             current = st.session_state.get("referrer_pick")
-            if current in filtered:
-                idx = filtered.index(current)
-            else:
-                idx = 0
+            idx = filtered.index(current) if current in filtered else 0
 
             selected = st.selectbox(
                 "Select referrer",
