@@ -2,10 +2,11 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v5: fixes individual referrer selection freeze for good. The selectbox widget
-    OWNS its session-state key — we never manually assign to it. We only `pop`
-    it when it holds a stale value not present in the current dataset, which
-    lets Streamlit re-initialize it cleanly at index 0.
+v6: fixes individual referrer selection freeze for good, using a dataset
+    fingerprint. The selectbox widget OWNS its session-state key — we never
+    manually assign to it. We only `pop` it when the underlying dataset
+    changes (tracked via a stable fingerprint), which lets Streamlit
+    re-initialize it cleanly at index 0.
 """
 import io
 import re
@@ -510,9 +511,7 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
-# --- session state ---
-# NOTE: we deliberately do NOT pre-initialize "referrer_pick" here.
-# The selectbox widget owns that key; we only manage it reactively below.
+# --- session state (non-widget keys only) ---
 if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
 if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
 if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
@@ -529,8 +528,6 @@ if uploaded is not None:
     st.session_state.source_name = uploaded.name
     st.session_state.report_buf  = None
     st.session_state.df_cache    = None
-    # Drop any stale referrer widget state so a fresh file re-inits the selectbox.
-    st.session_state.pop("referrer_pick", None)
 
 st.subheader("Option 2 — Google Drive / Sheets link")
 st.caption("Share the file as 'Anyone with the link', then paste the link here.")
@@ -546,7 +543,6 @@ if st.button("Fetch from Drive"):
                 st.session_state.source_name = "drive_file.xls"
                 st.session_state.report_buf  = None
                 st.session_state.df_cache    = None
-                st.session_state.pop("referrer_pick", None)
                 st.success("File fetched successfully.")
             except Exception as e:
                 st.error(f"Drive fetch failed: {e}")
@@ -589,8 +585,6 @@ if st.session_state.raw_bytes is not None:
 
             st.session_state.report_buf = buf.getvalue()
             st.session_state.df_cache   = df
-            # Clear any stale referrer widget state for the new dataset.
-            st.session_state.pop("referrer_pick", None)
             st.session_state.summary = {
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
@@ -646,43 +640,44 @@ if st.session_state.df_cache is not None:
         st.warning("No referrers available in the loaded data.")
     else:
         # ------------------------------------------------------------------
-        # Widget-state management (the actual fix)
+        # Dataset fingerprint — reset the widget ONLY when the data changes.
+        # The fingerprint must be cheap and stable across reruns of the same
+        # dataset, and different across different datasets.
         # ------------------------------------------------------------------
-        # "referrer_pick" is a WIDGET key — Streamlit owns it. We must NEVER
-        # manually assign to it in a way that fights the widget. The only
-        # legitimate thing we do is:
-        #
-        #   1. If the stored value is STALE (not in the current options list,
-        #      e.g. after loading a new file), pop it so Streamlit re-inits
-        #      the widget cleanly at index 0.
-        #   2. Otherwise, leave it alone and let the widget's own state persist
-        #      the user's selection across reruns.
-        # ------------------------------------------------------------------
-        if "referrer_pick" in st.session_state \
-                and st.session_state["referrer_pick"] not in referrer_list:
+        dataset_id = (
+            st.session_state.get("source_name", ""),
+            len(referrer_list),
+            tuple(referrer_list[:3]),
+            tuple(referrer_list[-3:]),
+        )
+
+        if st.session_state.get("_referrer_dataset_id") != dataset_id:
+            # New dataset: drop the widget key so Streamlit re-inits at index 0.
             st.session_state.pop("referrer_pick", None)
+            st.session_state["_referrer_dataset_id"] = dataset_id
 
         # Optional search box that filters the dropdown.
-        query = st.text_input("Search referrer (optional)", value="",
-                              key="referrer_search_query").strip().upper()
+        query = st.text_input(
+            "Search referrer (optional)",
+            value="",
+            key="referrer_search_query",
+        ).strip().upper()
 
-        if query:
-            filtered = [r for r in referrer_list if query in r]
-        else:
-            filtered = referrer_list
+        filtered = [r for r in referrer_list if query in r] if query else referrer_list
 
         if not filtered:
             st.warning("No referrer matches your search.")
         else:
-            # If the currently stored widget value isn't in `filtered`,
-            # pop it so Streamlit re-inits at index 0 of the filtered list.
-            if "referrer_pick" in st.session_state \
-                    and st.session_state["referrer_pick"] not in filtered:
+            # If the stored value isn't in the (possibly filtered) options,
+            # clear it so the selectbox falls back to index 0 cleanly.
+            current = st.session_state.get("referrer_pick")
+            if current is not None and current not in filtered:
                 st.session_state.pop("referrer_pick", None)
 
             selected = st.selectbox(
                 "Select referrer",
                 options=filtered,
+                index=0,
                 key="referrer_pick",
             )
 
