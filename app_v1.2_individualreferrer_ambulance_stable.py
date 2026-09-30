@@ -2,17 +2,19 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v8: adds an Ambulance Audit panel so you can see, straight from the app:
-      * every referrer who has at least one ambulance charge,
-      * the total ambulance amount per referrer,
-      * every individual ambulance row (RefNo, patient, referrer, charge),
-      * the actual column names / dtype / value counts of the Ambulance column,
-        so we can confirm what the source file really contains instead of guessing.
+v9: print-density fix. Removed the manual row_breaks that forced one
+    referrer block per printed page. Excel now flows blocks naturally and
+    packs as many per A4 portrait page as legibly fit (target: 2–3 doctors
+    per page). Added A4 paper size and tighter margins for more printable
+    area. Also shrunk inter-block trailing space (r += 2 → r += 1) and set
+    explicit heights on the title/period/header rows to squeeze blocks.
+    Single-referrer sheets still repeat their header rows across printed
+    pages; multi-referrer sheets do not, so each block keeps its own header.
 
-    The individual-referrer widget logic (v7) is unchanged: the selectbox
-    OWNS its session-state key, we only pop it when the dataset identity
-    changes, and we compute the fallback index ourselves instead of popping
-    on filter mismatch.
+    Everything from v8 is preserved: the Ambulance Audit panel, ambulance
+    metrics on the individual statement, ambulance column in the row
+    preview, and the v7 individual-referrer widget logic (dataset
+    fingerprint, no popping on filter mismatch).
 """
 import io
 import re
@@ -392,11 +394,13 @@ def write_block(ws, start_row, referrer, df, period_text):
     for c in range(1, 10):
         ws.cell(row=r, column=c).fill = FILL_REF
         ws.cell(row=r, column=c).border = BORDER
+    ws.row_dimensions[r].height = 14
     r += 1
 
     ws.cell(row=r, column=1, value=period_text)
     ws.cell(row=r, column=1).font = FONT_PERIOD
     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=9)
+    ws.row_dimensions[r].height = 12
     r += 1
 
     header_row = r
@@ -406,6 +410,7 @@ def write_block(ws, start_row, referrer, df, period_text):
         c.fill = FILL_HEADER
         c.alignment = CENTER
         c.border = BORDER
+    ws.row_dimensions[r].height = 14
     r += 1
 
     for i, (_, row) in enumerate(df.iterrows(), 1):
@@ -452,7 +457,7 @@ def write_block(ws, start_row, referrer, df, period_text):
 
     ws.cell(row=r, column=1, value="Thanks & Regards")
     ws.cell(row=r, column=1).font = FONT_THANKS
-    r += 2
+    r += 1   # ← was 2; saves a row per block for tighter print packing
 
     return r, header_row
 
@@ -467,21 +472,29 @@ def build_workbook(df, ref_groups, packed, period_text):
         ws = wb.create_sheet(sn)
         for i, w in enumerate(COL_WIDTHS, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
+
+        # --- page setup: pack as many blocks per printed page as fit ---
         ws.page_setup.orientation = "portrait"
-        ws.page_setup.fitToWidth = 1
-        ws.page_setup.fitToHeight = 0
+        ws.page_setup.paperSize   = ws.PAPERSIZE_A4
+        ws.page_setup.fitToWidth  = 1     # always fit the 9 cols to 1 page wide
+        ws.page_setup.fitToHeight = 0     # as many pages tall as needed
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.print_options.horizontalCentered = True
+        ws.page_margins.left   = 0.3
+        ws.page_margins.right  = 0.3
+        ws.page_margins.top    = 0.4
+        ws.page_margins.bottom = 0.4
 
+        # Repeat header rows ONLY for single-referrer sheets (multi-page
+        # statements keep the header on every page). For multi-referrer
+        # sheets, each block carries its own header, so don't repeat.
         if len(group) == 1:
             ws.print_title_rows = "1:3"
 
         row = 1
-        first_block = True
         for referrer, g in group:
-            if not first_block:
-                ws.row_breaks.append(Break(id=row - 1))
-            first_block = False
+            # NO manual row breaks — let Excel flow blocks naturally and
+            # pack as many per page as legibly fit.
             row, hr = write_block(ws, row, referrer, g, period_text)
             sheet_map[referrer] = (sn, hr - 2)
 
@@ -499,11 +512,17 @@ def build_individual_workbook(referrer, df_one, period_text):
 
     for i, w in enumerate(COL_WIDTHS, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
+
     ws.page_setup.orientation = "portrait"
-    ws.page_setup.fitToWidth = 1
+    ws.page_setup.paperSize   = ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth  = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_options.horizontalCentered = True
+    ws.page_margins.left   = 0.3
+    ws.page_margins.right  = 0.3
+    ws.page_margins.top    = 0.4
+    ws.page_margins.bottom = 0.4
     ws.print_title_rows = "1:3"
 
     write_block(ws, 1, referrer, df_one, period_text)
