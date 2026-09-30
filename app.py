@@ -2,18 +2,17 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v7: individual-referrer section rewritten to be bulletproof against the
-    "page resets when I pick a doctor" symptom. Key points:
+v8: adds an Ambulance Audit panel so you can see, straight from the app:
+      * every referrer who has at least one ambulance charge,
+      * the total ambulance amount per referrer,
+      * every individual ambulance row (RefNo, patient, referrer, charge),
+      * the actual column names / dtype / value counts of the Ambulance column,
+        so we can confirm what the source file really contains instead of guessing.
 
-      * The selectbox widget OWNS its session-state key.
-      * We NEVER assign to it directly.
-      * We ONLY reset it (pop the key) when the underlying dataset changes,
-        detected via a small, stable fingerprint: (source_name, len(df)).
-      * When the widget's stored value isn't in the current option list,
-        we compute the correct index ourselves instead of popping the key.
-        Popping on filter mismatch is what caused Streamlit to treat the
-        widget as brand-new on every rerun and re-initialize at index 0.
-      * No `value=` + `key=` conflicts on the search text_input.
+    The individual-referrer widget logic (v7) is unchanged: the selectbox
+    OWNS its session-state key, we only pop it when the dataset identity
+    changes, and we compute the fallback index ourselves instead of popping
+    on filter mismatch.
 """
 import io
 import re
@@ -137,7 +136,8 @@ def load_source(raw_bytes, filename="file.xls"):
                         "Investigation Charge"],
         "DiscPercent": ["DiscPercent", "Disc", "Discount"],
         "CutRate":     ["CutRate", "PercentCut", "Percent Cut"],
-        "Ambulance":   ["Ambulance", "Ambulance Charge"],
+        "Ambulance":   ["Ambulance", "Ambulance Charge", "Amb", "AMB",
+                        "Ambulance<br>", "Ambulance\n", "Ambulance "],
     }
     rename = {}
     for canonical, options in aliases.items():
@@ -410,7 +410,7 @@ def write_block(ws, start_row, referrer, df, period_text):
 
     for i, (_, row) in enumerate(df.iterrows(), 1):
         amb = row["Ambulance"]
-        amb_disp = -100 if amb == 100 else ""
+        amb_disp = -100 if amb and amb != 0 else ""
         test_name = str(row["TestName"])
         test_font = FONT_BODY_SM if len(test_name) > LONG_TEST_CHARS else FONT_BODY
 
@@ -544,7 +544,6 @@ if uploaded is not None:
         st.session_state.source_name = uploaded.name
         st.session_state.report_buf  = None
         st.session_state.df_cache    = None
-        # Force a dataset-identity change so the referrer widget resets.
         st.session_state.pop("_referrer_dataset_id", None)
 
 st.subheader("Option 2 — Google Drive / Sheets link")
@@ -615,7 +614,6 @@ if st.session_state.raw_bytes is not None:
                     for n, g in ref_groups[:15]
                 ],
             }
-            # Force the referrer widget to reset for the new dataset.
             st.session_state.pop("_referrer_dataset_id", None)
 
 # ---------------- combined report download ----------------
@@ -648,6 +646,52 @@ if st.session_state.report_buf is not None:
         })
         st.dataframe(preview, hide_index=True, use_container_width=True)
 
+# ---------------- ambulance audit ----------------
+if st.session_state.df_cache is not None:
+    st.divider()
+    with st.expander("🚑 Ambulance Audit — verify what's in the source file",
+                     expanded=False):
+        df_amb = st.session_state.df_cache
+
+        st.write("**Ambulance column sanity check**")
+        st.write("Columns found:", list(df_amb.columns))
+        st.write("Ambulance dtype:", str(df_amb["Ambulance"].dtype))
+        st.write("Unique ambulance values (up to 30):",
+                 sorted(df_amb["Ambulance"].unique().tolist())[:30])
+        st.write("Value counts:",
+                 df_amb["Ambulance"].value_counts().to_dict())
+
+        amb_df = df_amb[df_amb["Ambulance"] > 0]
+        st.write(f"**Total rows with Ambulance > 0: {len(amb_df)}**")
+
+        if amb_df.empty:
+            st.warning("No rows have a non-zero Ambulance value. "
+                       "If you expect ambulance charges, the column may not "
+                       "be parsing correctly — compare the columns listed above "
+                       "against your source file.")
+        else:
+            st.write("**Referrers with at least one ambulance charge:**")
+            per_ref = (
+                amb_df.groupby("ReferBy")
+                      .agg(Ambulance_Rows=("Ambulance", "size"),
+                           Total_Ambulance=("Ambulance", "sum"))
+                      .sort_values("Total_Ambulance", ascending=False)
+                      .reset_index()
+                      .rename(columns={"ReferBy": "Referrer"})
+            )
+            st.dataframe(per_ref, use_container_width=True, hide_index=True)
+
+            st.write("**Every ambulance row in the file:**")
+            show_cols = [c for c in
+                         ["RefNo", "PatientName", "ReferBy", "BillDate",
+                          "TestName", "Ambulance"]
+                         if c in amb_df.columns]
+            st.dataframe(
+                amb_df[show_cols].reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+            )
+
 # ---------------- individual referrer download ----------------
 if st.session_state.df_cache is not None:
     st.divider()
@@ -662,19 +706,16 @@ if st.session_state.df_cache is not None:
         st.warning("No referrers available in the loaded data.")
     else:
         # Stable dataset fingerprint — only (source_name, len(df)).
-        # Never includes referrer names, since those can reorder.
         dataset_id = (
             st.session_state.get("source_name", ""),
             int(len(df)),
         )
 
-        # Reset the widget ONLY when the dataset identity changes.
         if st.session_state.get("_referrer_dataset_id") != dataset_id:
             st.session_state.pop("referrer_pick", None)
             st.session_state.pop("referrer_search_query", None)
             st.session_state["_referrer_dataset_id"] = dataset_id
 
-        # Search box — no `value=` alongside `key=`, to avoid state fights.
         query = st.text_input(
             "Search referrer (optional)",
             key="referrer_search_query",
@@ -685,9 +726,6 @@ if st.session_state.df_cache is not None:
         if not filtered:
             st.warning("No referrer matches your search.")
         else:
-            # Compute the index ourselves. NEVER pop the widget key just
-            # because the current value isn't in `filtered` — that is what
-            # made Streamlit treat the widget as brand-new on every rerun.
             current = st.session_state.get("referrer_pick")
             idx = filtered.index(current) if current in filtered else 0
 
@@ -704,16 +742,24 @@ if st.session_state.df_cache is not None:
                 if df_one.empty:
                     st.warning(f"No rows found for {selected}.")
                 else:
-                    col1, col2 = st.columns(2)
+                    amb_rows = int((df_one["Ambulance"] > 0).sum())
+                    amb_total = float(df_one["Ambulance"].sum())
+
+                    col1, col2, col3, col4 = st.columns(4)
                     with col1:
                         st.metric("Line items", f"{len(df_one):,}")
                     with col2:
                         st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
+                    with col3:
+                        st.metric("Ambulance rows", f"{amb_rows:,}")
+                    with col4:
+                        st.metric("Ambulance ₹", f"{amb_total:,.0f}")
 
                     with st.expander("Preview rows"):
                         st.dataframe(
                             df_one[["BillDate", "PatientName", "TestName",
-                                    "PatientRate", "DiscPercent", "CutRate", "Rate"]],
+                                    "PatientRate", "Ambulance",
+                                    "DiscPercent", "CutRate", "Rate"]],
                             hide_index=True,
                             use_container_width=True,
                         )
