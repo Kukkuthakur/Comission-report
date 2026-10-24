@@ -268,43 +268,51 @@ def pack_referrers(ref_groups):
 # INDEX — 3 side-by-side tables in portrait, bigger fonts
 # ------------------------------------------------------------------
 def write_index(ws, ref_groups, sheet_map, period_text):
-    """Three stacked-column tables: col-blocks (A-D), (F-I), (K-N)."""
+    """
+    Two side-by-side tables:
+      Table 1 -> cols A-H
+      gap     -> col I
+      Table 2 -> cols J-Q
+    Each table: Referrer | Lines | Rate | S/A | F/NF | D/ND | ONLINE | Go
+    """
     FONT_IDX_TITLE  = Font(name="Calibri", size=14, bold=True)
     FONT_IDX_HEADER = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
     FONT_IDX_BODY   = Font(name="Calibri", size=10)
     FONT_IDX_TOTAL  = Font(name="Calibri", size=10, bold=True)
     FONT_IDX_LINK   = Font(name="Calibri", size=10, color="0563C1", underline="single")
 
+    IDX_HEADERS = ["Referrer", "Lines", "Rate (₹)",
+                   "S/A", "F/NF", "D/ND", "ONLINE", "Go"]
+
     ws["A1"] = f"Commission Report Index — {period_text}"
     ws["A1"].font = FONT_IDX_TITLE
-    ws.merge_cells("A1:N1")
+    ws.merge_cells("A1:Q1")
     ws.row_dimensions[1].height = 20
 
-    table_starts = [1, 6, 11]
-    col_widths = {
-        1: 26, 2: 7, 3: 11, 4: 5,
-        5: 2,
-        6: 26, 7: 7, 8: 11, 9: 5,
-        10: 2,
-        11: 26, 12: 7, 13: 11, 14: 5,
-    }
+    table_starts = [1, 10]          # A (1) and J (10); col I (9) is spacer
+
+    block_widths = [26, 7, 11, 6, 7, 7, 9, 5]
+    col_widths = {}
+    for start in table_starts:
+        for off, w in enumerate(block_widths):
+            col_widths[start + off] = w
+    col_widths[9] = 2
     for c, w in col_widths.items():
         ws.column_dimensions[get_column_letter(c)].width = w
 
     n = len(ref_groups)
-    per_col = (n + 2) // 3
+    per_col = (n + 1) // 2
     columns = [ref_groups[0:per_col],
-               ref_groups[per_col:2*per_col],
-               ref_groups[2*per_col:3*per_col]]
+               ref_groups[per_col:2*per_col]]
 
     header_row = 2
-    start_row = 3
+    start_row  = 3
 
     grand_total = 0.0
     grand_items = 0
 
-    for tbl_idx, (start_col, group) in enumerate(zip(table_starts, columns)):
-        for i, h in enumerate(["Referrer", "Lines", "Rate (₹)", "Go"]):
+    for start_col, group in zip(table_starts, columns):
+        for i, h in enumerate(IDX_HEADERS):
             c = ws.cell(row=header_row, column=start_col + i, value=h)
             c.font = FONT_IDX_HEADER
             c.fill = FILL_HEADER
@@ -326,7 +334,11 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = RIGHT
             c.number_format = "#,##0"
 
-            link = ws.cell(row=r, column=start_col + 3, value="►")
+            for i in range(3, 7):                        # S/A, F/NF, D/ND, ONLINE
+                c = ws.cell(row=r, column=start_col + i, value=None)
+                c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = CENTER
+
+            link = ws.cell(row=r, column=start_col + 7, value="►")
             link.hyperlink = f"#'{sn}'!A{fr}"
             link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
 
@@ -350,20 +362,21 @@ def write_index(ws, ref_groups, sheet_map, period_text):
         c.border = BORDER; c.alignment = RIGHT
         c.number_format = "#,##0"
 
-        c = ws.cell(row=r, column=start_col + 3)
-        c.fill = FILL_TOTAL; c.border = BORDER
+        for i in range(3, 8):
+            c = ws.cell(row=r, column=start_col + i)
+            c.fill = FILL_TOTAL; c.border = BORDER
 
     last_row = start_row + per_col + 1
     ws.cell(row=last_row + 1, column=1, value="GRAND TOTAL")
     ws.cell(row=last_row + 1, column=2, value=grand_items)
     c = ws.cell(row=last_row + 1, column=3, value=grand_total)
     c.number_format = "#,##0"
-    for j in range(1, 5):
+    for j in range(1, 9):
         cc = ws.cell(row=last_row + 1, column=j)
         cc.font = FONT_IDX_TOTAL
         cc.fill = FILL_TOTAL
         cc.border = BORDER
-        cc.alignment = CENTER if j in (2, 4) else (LEFT if j == 1 else RIGHT)
+        cc.alignment = CENTER if j in (2, 4, 5, 6, 7, 8) else (LEFT if j == 1 else RIGHT)
     ws.row_dimensions[last_row + 1].height = 16
 
     ws.freeze_panes = "A3"
@@ -371,14 +384,14 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1
+    ws.page_setup.fitToHeight = 2          # allow index to spread to 2 pages
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_margins.left = 0.35
     ws.page_margins.right = 0.35
     ws.page_margins.top = 0.5
     ws.page_margins.bottom = 0.5
     ws.print_options.horizontalCentered = True
-    ws.print_area = f"A1:N{last_row + 1}"
+    ws.print_area = f"A1:Q{last_row + 1}"
 
 
 def write_block(ws, start_row, referrer, df, period_text):
