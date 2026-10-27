@@ -1,25 +1,3 @@
-"""
-Commission Report Builder — Streamlit app
-Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
-
-v10: two fixes.
-   1) Index page no longer spills onto a second printed page — fitToHeight
-      forced to 1 instead of 2, so Excel scales the 17-column layout onto
-      a single A4 portrait page.
-   2) Period label is now a dynamic date range instead of a static month
-      name. Default is "1 Mon - D Mon YYYY" for the current month up to
-      today (e.g. "1 Oct - 27 Oct 2026"). The textbox is seeded once per
-      session so it stays editable but refreshes on a new session/day.
-      Optionally, when a file is loaded, the label auto-snaps to the actual
-      date span of the data (helpful when the source file is for a past
-      month).
-
-   Everything from v9 is preserved: print-density packing (no manual row
-   breaks), A4 portrait with tight margins, ambulance audit panel,
-   ambulance metrics on the individual statement, ambulance column in the
-   row preview, and the v7 individual-referrer widget logic (dataset
-   fingerprint, no popping on filter mismatch).
-"""
 import io
 import re
 import urllib.request
@@ -30,7 +8,6 @@ import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.pagebreak import Break  # kept for compat; unused
 
 
 # ---------------------------------------------------------------
@@ -47,8 +24,6 @@ def period_from_dates(date_strings):
     """
     Build a period label from a list/Series of 'dd/mm/yyyy' strings.
     Falls back to default_period_text() if no valid dates.
-    Same-month: '1 Oct - 27 Oct 2026'
-    Cross-month: '28 Sep 2026 - 5 Oct 2026'
     """
     ds = pd.to_datetime(pd.Series(date_strings), format="%d/%m/%Y", errors="coerce").dropna()
     if ds.empty:
@@ -64,7 +39,6 @@ DEFAULT_PERIOD = default_period_text()
 ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
 XL_THRESHOLD   = 20
-EXPECTED_TOTAL = 172400  # set to 0 to disable
 
 # ---------- statement styling ----------
 FONT_TITLE   = Font(name="Calibri", size=14, bold=True)
@@ -102,7 +76,7 @@ def normalize_referrer(name):
     s = str(name).strip()
     s = _SPACE_RE.sub(" ", s)
     s = _PUNCT_RE.sub("", s)
-    return s.upper()          # ← ALL CAPS
+    return s.upper()
 
 
 def is_html_bytes(b):
@@ -115,6 +89,7 @@ def clean_money(v):
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
+    # Strip all non-numeric characters except dots and minus signs
     s = re.sub(r"[^\d.\-]", "", str(v))
     try:
         return float(s) if s not in ("", "-", ".") else 0.0
@@ -129,11 +104,6 @@ def parse_date(v):
         return pd.to_datetime(v, dayfirst=True)
     except Exception:
         return None
-
-
-def fmt_date(v):
-    d = parse_date(v)
-    return d.strftime("%d/%m/%Y") if d is not None else str(v)
 
 
 def compute_rate(cut, disc, amb):
@@ -299,22 +269,16 @@ def pack_referrers(ref_groups):
     return sheets
 
 
-# ------------------------------------------------------------------
-# INDEX — two side-by-side tables in portrait, forced onto 1 page
-# ------------------------------------------------------------------
 def write_index(ws, ref_groups, sheet_map, period_text):
     """
-    Two side-by-side tables:
-      Table 1 -> cols A-H
-      gap     -> col I
-      Table 2 -> cols J-Q
-    Each table: Referrer | Lines | Rate | S/A | F/NF | D/ND | ONLINE | Go
+    Two side-by-side tables forced onto 1 single printed page.
+    Font and row heights tightened so 165+ referrers fit.
     """
     FONT_IDX_TITLE  = Font(name="Calibri", size=14, bold=True)
-    FONT_IDX_HEADER = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-    FONT_IDX_BODY   = Font(name="Calibri", size=10)
-    FONT_IDX_TOTAL  = Font(name="Calibri", size=10, bold=True)
-    FONT_IDX_LINK   = Font(name="Calibri", size=10, color="0563C1", underline="single")
+    FONT_IDX_HEADER = Font(name="Calibri", size=9, bold=True, color="FFFFFF")
+    FONT_IDX_BODY   = Font(name="Calibri", size=9)
+    FONT_IDX_TOTAL  = Font(name="Calibri", size=9, bold=True)
+    FONT_IDX_LINK   = Font(name="Calibri", size=9, color="0563C1", underline="single")
 
     IDX_HEADERS = ["Referrer", "Lines", "Rate (₹)",
                    "S/A", "F/NF", "D/ND", "ONLINE", "Go"]
@@ -353,7 +317,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             c.fill = FILL_HEADER
             c.alignment = CENTER
             c.border = BORDER
-        ws.row_dimensions[header_row].height = 15
+        ws.row_dimensions[header_row].height = 14
 
         r = start_row
         for name, g in group:
@@ -377,7 +341,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             link.hyperlink = f"#'{sn}'!A{fr}"
             link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
 
-            ws.row_dimensions[r].height = 14
+            ws.row_dimensions[r].height = 11  # Tighter row height to guarantee 1 page
             grand_total += float(g["Rate"].sum())
             grand_items += len(g)
             r += 1
@@ -412,19 +376,19 @@ def write_index(ws, ref_groups, sheet_map, period_text):
         cc.fill = FILL_TOTAL
         cc.border = BORDER
         cc.alignment = CENTER if j in (2, 4, 5, 6, 7, 8) else (LEFT if j == 1 else RIGHT)
-    ws.row_dimensions[last_row + 1].height = 16
+    ws.row_dimensions[last_row + 1].height = 14
 
     ws.freeze_panes = "A3"
 
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 1          # v10: force a single printed page
+    ws.page_setup.fitToHeight = 1          
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_margins.left = 0.35
     ws.page_margins.right = 0.35
-    ws.page_margins.top = 0.5
-    ws.page_margins.bottom = 0.5
+    ws.page_margins.top = 0.4
+    ws.page_margins.bottom = 0.4
     ws.print_options.horizontalCentered = True
     ws.print_area = f"A1:Q{last_row + 1}"
 
@@ -505,7 +469,7 @@ def write_block(ws, start_row, referrer, df, period_text):
 
     ws.cell(row=r, column=1, value="Thanks & Regards")
     ws.cell(row=r, column=1).font = FONT_THANKS
-    r += 1   # tighter packing for print
+    r += 1   
 
     return r, header_row
 
@@ -545,7 +509,6 @@ def build_workbook(df, ref_groups, packed, period_text):
 
 
 def build_individual_workbook(referrer, df_one, period_text):
-    """Single-sheet workbook: one referrer's statement, sheet named after the referrer."""
     wb = Workbook()
     ws = wb.active
     safe_name = re.sub(r"[\[\]:*?/\\]", "-", str(referrer))[:31]
@@ -581,15 +544,12 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
-# --- non-widget session state ---
 if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
 if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
 if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
 if "summary"     not in st.session_state: st.session_state.summary     = None
 if "df_cache"    not in st.session_state: st.session_state.df_cache    = None
 
-# v10: seed the period textbox once per session with today's range.
-# User can edit freely; won't be overwritten on rerun.
 if "period_text_input" not in st.session_state:
     st.session_state["period_text_input"] = default_period_text()
 
@@ -644,9 +604,6 @@ if st.session_state.raw_bytes is not None:
                 st.warning("No rows found after cleaning. Check your file.")
                 st.stop()
 
-            # v10: snap the header label to the actual data date range when
-            # the user hasn't manually customized it. This way a September
-            # file loaded in late October still shows the right span.
             data_period = period_from_dates(df["BillDate"])
             if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
                 st.session_state["period_text_input"] = data_period
@@ -680,7 +637,6 @@ if st.session_state.raw_bytes is not None:
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
                 "total_rate": computed_total,
-                "expected": EXPECTED_TOTAL,
                 "period": period_text,
                 "top": [
                     (n, len(g), float(g["Rate"].sum()))
@@ -689,20 +645,11 @@ if st.session_state.raw_bytes is not None:
             }
             st.session_state.pop("_referrer_dataset_id", None)
 
-# ---------------- combined report download ----------------
 if st.session_state.report_buf is not None:
     s = st.session_state.summary
     st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers "
                f"— period **{s.get('period', period_text)}**.")
     st.metric("Computed total Rate (₹)", f"{s['total_rate']:,.0f}")
-
-    if s.get("expected"):
-        diff = s["total_rate"] - s["expected"]
-        if abs(diff) < 1:
-            st.info(f"✔ Total matches source TOTAL row (₹{s['expected']:,}).")
-        else:
-            st.warning(f"⚠️ Computed total differs from source TOTAL "
-                       f"(₹{s['expected']:,}) by ₹{diff:+,.0f}.")
 
     st.download_button(
         label="⬇️ Download combined report (.xlsx)",
@@ -720,7 +667,6 @@ if st.session_state.report_buf is not None:
         })
         st.dataframe(preview, hide_index=True, use_container_width=True)
 
-# ---------------- ambulance audit ----------------
 if st.session_state.df_cache is not None:
     st.divider()
     with st.expander("🚑 Ambulance Audit — verify what's in the source file",
@@ -766,7 +712,6 @@ if st.session_state.df_cache is not None:
                 hide_index=True,
             )
 
-# ---------------- individual referrer download ----------------
 if st.session_state.df_cache is not None:
     st.divider()
     st.subheader("Individual Referrer Statement")
@@ -780,4 +725,37 @@ if st.session_state.df_cache is not None:
         st.warning("No referrers available in the loaded data.")
     else:
         dataset_id = (
-            st.session
+            st.session_state.get("source_name", ""),
+            int(len(df)),
+        )
+
+        if st.session_state.get("_referrer_dataset_id") != dataset_id:
+            st.session_state.pop("referrer_pick", None)
+            st.session_state.pop("referrer_search_query", None)
+            st.session_state["_referrer_dataset_id"] = dataset_id
+
+        query = st.text_input(
+            "Search referrer (optional)",
+            key="referrer_search_query",
+        ).strip().upper()
+
+        filtered = [r for r in referrer_list if query in r] if query else referrer_list
+
+        if not filtered:
+            st.warning("No referrer matches your search.")
+        else:
+            current = st.session_state.get("referrer_pick")
+            idx = filtered.index(current) if current in filtered else 0
+
+            selected = st.selectbox(
+                "Select referrer",
+                options=filtered,
+                index=idx,
+                key="referrer_pick",
+            )
+
+            if selected:
+                df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
+
+                if df_one.empty:
+                    st.w
