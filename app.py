@@ -171,6 +171,10 @@ def load_source(raw_bytes, filename="file.xls"):
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
 
+    # Capture the original Rate column before dropping it, so we can audit it later
+    if "Rate" in df.columns:
+        df["_orig_file_rate"] = df["Rate"].apply(clean_money)
+        
     for c in ["Rate", "Profit"]:
         if c in df.columns:
             df = df.drop(columns=[c])
@@ -644,29 +648,27 @@ if st.session_state.raw_bytes is not None:
 
             computed_total = float(df["Rate"].sum())
 
-            # Anomaly detection: compare source Rate column to our calculated Rate
-            source_rate_col = next(
-                (c for c in raw_df.columns if str(c).strip().upper() == "RATE"),
-                None,
-            )
+            # Anomaly detection: compare source Rate to calculated Rate using a unique key
             anomalies = []
-            if source_rate_col is not None:
-                clean_raw_rate = raw_df[source_rate_col].apply(clean_money)
-                clean_calc_rate = df["Rate"]
-                min_len = min(len(clean_raw_rate), len(clean_calc_rate))
-                diff = (
-                    clean_raw_rate.iloc[:min_len].reset_index(drop=True)
-                    - clean_calc_rate.iloc[:min_len].reset_index(drop=True)
-                )
-                diff_mask = diff.abs() > 0.01
+            if "_orig_file_rate" in df.columns:
+                df_audit = df.copy()
+                
+                # Find mathematically different rates
+                diff_mask = (df_audit["_orig_file_rate"] - df_audit["Rate"]).abs() > 0.01
+                
                 if diff_mask.any():
-                    anomaly_df = df.iloc[:min_len][diff_mask].copy().reset_index(drop=True)
-                    anomaly_df["File_Rate"] = clean_raw_rate.iloc[:min_len][diff_mask].values
-                    anomaly_df["App_Rate"]  = clean_calc_rate.iloc[:min_len][diff_mask].values
+                    anomaly_df = df_audit[diff_mask].copy()
+                    anomaly_df = anomaly_df.rename(columns={
+                        "_orig_file_rate": "File_Rate",
+                        "Rate": "App_Rate"
+                    })
                     anomalies = anomaly_df[
-                        ["BillDate", "PatientName", "TestName",
+                        ["BillDate", "PatientName", "TestName", 
                          "CutRate", "File_Rate", "App_Rate"]
                     ].to_dict("records")
+                    
+                # Clean up the helper column so it doesn't show in the app UI
+                df = df.drop(columns=["_orig_file_rate"])
 
             st.session_state.report_buf = buf.getvalue()
             st.session_state.df_cache   = df
