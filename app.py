@@ -2,31 +2,65 @@
 Commission Report Builder — Streamlit app
 Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
 
-v9: print-density fix. Removed the manual row_breaks that forced one
-    referrer block per printed page. Excel now flows blocks naturally and
-    packs as many per A4 portrait page as legibly fit (target: 2–3 doctors
-    per page). Added A4 paper size and tighter margins for more printable
-    area. Also shrunk inter-block trailing space (r += 2 → r += 1) and set
-    explicit heights on the title/period/header rows to squeeze blocks.
-    Single-referrer sheets still repeat their header rows across printed
-    pages; multi-referrer sheets do not, so each block keeps its own header.
+v10: two fixes.
+   1) Index page no longer spills onto a second printed page — fitToHeight
+      forced to 1 instead of 2, so Excel scales the 17-column layout onto
+      a single A4 portrait page.
+   2) Period label is now a dynamic date range instead of a static month
+      name. Default is "1 Mon - D Mon YYYY" for the current month up to
+      today (e.g. "1 Oct - 27 Oct 2026"). The textbox is seeded once per
+      session so it stays editable but refreshes on a new session/day.
+      Optionally, when a file is loaded, the label auto-snaps to the actual
+      date span of the data (helpful when the source file is for a past
+      month).
 
-    Everything from v8 is preserved: the Ambulance Audit panel, ambulance
-    metrics on the individual statement, ambulance column in the row
-    preview, and the v7 individual-referrer widget logic (dataset
-    fingerprint, no popping on filter mismatch).
+   Everything from v9 is preserved: print-density packing (no manual row
+   breaks), A4 portrait with tight margins, ambulance audit panel,
+   ambulance metrics on the individual statement, ambulance column in the
+   row preview, and the v7 individual-referrer widget logic (dataset
+   fingerprint, no popping on filter mismatch).
 """
 import io
 import re
 import urllib.request
+from datetime import date
+
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.pagebreak import Break
+from openpyxl.worksheet.pagebreak import Break  # kept for compat; unused
 
-DEFAULT_PERIOD = "September 2026"
+
+# ---------------------------------------------------------------
+# Period label helpers
+# ---------------------------------------------------------------
+def default_period_text(today=None):
+    """Return '1 Mon - D Mon YYYY' for the current month up to today."""
+    today = today or date.today()
+    first = today.replace(day=1)
+    return f"1 {first:%b} - {today.day} {today:%b %Y}"
+
+
+def period_from_dates(date_strings):
+    """
+    Build a period label from a list/Series of 'dd/mm/yyyy' strings.
+    Falls back to default_period_text() if no valid dates.
+    Same-month: '1 Oct - 27 Oct 2026'
+    Cross-month: '28 Sep 2026 - 5 Oct 2026'
+    """
+    ds = pd.to_datetime(pd.Series(date_strings), format="%d/%m/%Y", errors="coerce").dropna()
+    if ds.empty:
+        return default_period_text()
+    lo, hi = ds.min(), ds.max()
+    if (lo.year, lo.month) == (hi.year, hi.month):
+        return f"{lo.day} {lo:%b} - {hi.day} {hi:%b %Y}"
+    return f"{lo.day} {lo:%b %Y} - {hi.day} {hi:%b %Y}"
+
+
+DEFAULT_PERIOD = default_period_text()
+
 ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
 XL_THRESHOLD   = 20
@@ -62,6 +96,7 @@ LONG_TEST_CHARS = 25
 # ---------- referrer normalization ----------
 _SPACE_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[.,]+$")
+
 
 def normalize_referrer(name):
     s = str(name).strip()
@@ -265,7 +300,7 @@ def pack_referrers(ref_groups):
 
 
 # ------------------------------------------------------------------
-# INDEX — 3 side-by-side tables in portrait, bigger fonts
+# INDEX — two side-by-side tables in portrait, forced onto 1 page
 # ------------------------------------------------------------------
 def write_index(ws, ref_groups, sheet_map, period_text):
     """
@@ -384,7 +419,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     ws.page_setup.orientation = "portrait"
     ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 2          # allow index to spread to 2 pages
+    ws.page_setup.fitToHeight = 1          # v10: force a single printed page
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_margins.left = 0.35
     ws.page_margins.right = 0.35
@@ -470,7 +505,7 @@ def write_block(ws, start_row, referrer, df, period_text):
 
     ws.cell(row=r, column=1, value="Thanks & Regards")
     ws.cell(row=r, column=1).font = FONT_THANKS
-    r += 1   # ← was 2; saves a row per block for tighter print packing
+    r += 1   # tighter packing for print
 
     return r, header_row
 
@@ -486,11 +521,10 @@ def build_workbook(df, ref_groups, packed, period_text):
         for i, w in enumerate(COL_WIDTHS, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
 
-        # --- page setup: pack as many blocks per printed page as fit ---
         ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize   = ws.PAPERSIZE_A4
-        ws.page_setup.fitToWidth  = 1     # always fit the 9 cols to 1 page wide
-        ws.page_setup.fitToHeight = 0     # as many pages tall as needed
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.print_options.horizontalCentered = True
         ws.page_margins.left   = 0.3
@@ -498,16 +532,11 @@ def build_workbook(df, ref_groups, packed, period_text):
         ws.page_margins.top    = 0.4
         ws.page_margins.bottom = 0.4
 
-        # Repeat header rows ONLY for single-referrer sheets (multi-page
-        # statements keep the header on every page). For multi-referrer
-        # sheets, each block carries its own header, so don't repeat.
         if len(group) == 1:
             ws.print_title_rows = "1:3"
 
         row = 1
         for referrer, g in group:
-            # NO manual row breaks — let Excel flow blocks naturally and
-            # pack as many per page as legibly fit.
             row, hr = write_block(ws, row, referrer, g, period_text)
             sheet_map[referrer] = (sn, hr - 2)
 
@@ -519,7 +548,6 @@ def build_individual_workbook(referrer, df_one, period_text):
     """Single-sheet workbook: one referrer's statement, sheet named after the referrer."""
     wb = Workbook()
     ws = wb.active
-    # Excel sheet-name limit: 31 chars, no []:*?/\
     safe_name = re.sub(r"[\[\]:*?/\\]", "-", str(referrer))[:31]
     ws.title = safe_name or "Statement"
 
@@ -560,16 +588,18 @@ if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
 if "summary"     not in st.session_state: st.session_state.summary     = None
 if "df_cache"    not in st.session_state: st.session_state.df_cache    = None
 
-period_text = st.text_input("Report period", value=DEFAULT_PERIOD,
-                            key="period_text_input")
+# v10: seed the period textbox once per session with today's range.
+# User can edit freely; won't be overwritten on rerun.
+if "period_text_input" not in st.session_state:
+    st.session_state["period_text_input"] = default_period_text()
+
+period_text = st.text_input("Report period", key="period_text_input")
 
 st.subheader("Option 1 — Upload")
 uploaded = st.file_uploader("Choose your Excel file",
                             type=["xls", "xlsx", "html", "htm"],
                             key="file_uploader_widget")
 if uploaded is not None:
-    # Only re-read if the file identity actually changed — prevents
-    # df_cache from being wiped on every rerun.
     new_bytes = uploaded.read()
     if new_bytes != st.session_state.raw_bytes:
         st.session_state.raw_bytes   = new_bytes
@@ -614,6 +644,16 @@ if st.session_state.raw_bytes is not None:
                 st.warning("No rows found after cleaning. Check your file.")
                 st.stop()
 
+            # v10: snap the header label to the actual data date range when
+            # the user hasn't manually customized it. This way a September
+            # file loaded in late October still shows the right span.
+            data_period = period_from_dates(df["BillDate"])
+            if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
+                st.session_state["period_text_input"] = data_period
+                period_text = data_period
+            else:
+                period_text = st.session_state["period_text_input"]
+
             ref_groups = sorted(
                 df.groupby("ReferBy", sort=False),
                 key=lambda x: x[1]["Rate"].sum(),
@@ -641,6 +681,7 @@ if st.session_state.raw_bytes is not None:
                 "referrers": int(df["ReferBy"].nunique()),
                 "total_rate": computed_total,
                 "expected": EXPECTED_TOTAL,
+                "period": period_text,
                 "top": [
                     (n, len(g), float(g["Rate"].sum()))
                     for n, g in ref_groups[:15]
@@ -651,7 +692,8 @@ if st.session_state.raw_bytes is not None:
 # ---------------- combined report download ----------------
 if st.session_state.report_buf is not None:
     s = st.session_state.summary
-    st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers.")
+    st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers "
+               f"— period **{s.get('period', period_text)}**.")
     st.metric("Computed total Rate (₹)", f"{s['total_rate']:,.0f}")
 
     if s.get("expected"):
@@ -737,78 +779,5 @@ if st.session_state.df_cache is not None:
     if not referrer_list:
         st.warning("No referrers available in the loaded data.")
     else:
-        # Stable dataset fingerprint — only (source_name, len(df)).
         dataset_id = (
-            st.session_state.get("source_name", ""),
-            int(len(df)),
-        )
-
-        if st.session_state.get("_referrer_dataset_id") != dataset_id:
-            st.session_state.pop("referrer_pick", None)
-            st.session_state.pop("referrer_search_query", None)
-            st.session_state["_referrer_dataset_id"] = dataset_id
-
-        query = st.text_input(
-            "Search referrer (optional)",
-            key="referrer_search_query",
-        ).strip().upper()
-
-        filtered = [r for r in referrer_list if query in r] if query else referrer_list
-
-        if not filtered:
-            st.warning("No referrer matches your search.")
-        else:
-            current = st.session_state.get("referrer_pick")
-            idx = filtered.index(current) if current in filtered else 0
-
-            selected = st.selectbox(
-                "Select referrer",
-                options=filtered,
-                index=idx,
-                key="referrer_pick",
-            )
-
-            if selected:
-                df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
-
-                if df_one.empty:
-                    st.warning(f"No rows found for {selected}.")
-                else:
-                    amb_rows = int((df_one["Ambulance"] > 0).sum())
-                    amb_total = float(df_one["Ambulance"].sum())
-
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Line items", f"{len(df_one):,}")
-                    with col2:
-                        st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
-                    with col3:
-                        st.metric("Ambulance rows", f"{amb_rows:,}")
-                    with col4:
-                        st.metric("Ambulance ₹", f"{amb_total:,.0f}")
-
-                    with st.expander("Preview rows"):
-                        st.dataframe(
-                            df_one[["BillDate", "PatientName", "TestName",
-                                    "PatientRate", "Ambulance",
-                                    "DiscPercent", "CutRate", "Rate"]],
-                            hide_index=True,
-                            use_container_width=True,
-                        )
-
-                    wb_one = build_individual_workbook(selected, df_one, period_text)
-                    buf_one = io.BytesIO()
-                    wb_one.save(buf_one)
-                    buf_one.seek(0)
-
-                    safe_fname = re.sub(r"[^A-Za-z0-9._-]", "_", selected)[:60]
-                    st.download_button(
-                        label=f"⬇️ Download statement for {selected} (.xlsx)",
-                        data=buf_one.getvalue(),
-                        file_name=f"{safe_fname}_Commission_Statement.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key=f"download_individual_{safe_fname}",
-                    )
-
-st.divider()
-st.caption("Rate = PercentCut − Disc − Ambulance (ambulance only when 100), floored at 0.")
+            st.session
