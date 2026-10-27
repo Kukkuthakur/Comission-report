@@ -1,36 +1,55 @@
-"""
-Commission Report Builder — Streamlit app
-Handles real .xls/.xlsx, HTML tables masquerading as .xls, and Google Drive / Sheets links.
-
-v9: print-density fix. Removed the manual row_breaks that forced one
-    referrer block per printed page. Excel now flows blocks naturally and
-    packs as many per A4 portrait page as legibly fit (target: 2–3 doctors
-    per page). Added A4 paper size and tighter margins for more printable
-    area. Also shrunk inter-block trailing space (r += 2 → r += 1) and set
-    explicit heights on the title/period/header rows to squeeze blocks.
-    Single-referrer sheets still repeat their header rows across printed
-    pages; multi-referrer sheets do not, so each block keeps its own header.
-
-    Everything from v8 is preserved: the Ambulance Audit panel, ambulance
-    metrics on the individual statement, ambulance column in the row
-    preview, and the v7 individual-referrer widget logic (dataset
-    fingerprint, no popping on filter mismatch).
-"""
 import io
 import re
 import urllib.request
+from datetime import date
+
 import pandas as pd
 import streamlit as st
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.pagebreak import Break
 
-DEFAULT_PERIOD = "September 2026"
+
+# ---------------------------------------------------------------
+# Period label helpers
+# ---------------------------------------------------------------
+def default_period_text(today=None):
+    """Return '1 Mon - D Mon YYYY' for the current month up to today."""
+    today = today or date.today()
+    first = today.replace(day=1)
+    return f"1 {first:%b} - {today.day} {today:%b %Y}"
+
+
+def period_from_dates(date_strings):
+    """
+    Build a period label from a list/Series of 'dd/mm/yyyy' strings.
+    Falls back to default_period_text() if no valid dates.
+    """
+    ds = pd.to_datetime(pd.Series(date_strings), format="%d/%m/%Y", errors="coerce").dropna()
+    if ds.empty:
+        return default_period_text()
+    lo, hi = ds.min(), ds.max()
+    if (lo.year, lo.month) == (hi.year, hi.month):
+        return f"{lo.day} {lo:%b} - {hi.day} {hi:%b %Y}"
+    return f"{lo.day} {lo:%b %Y} - {hi.day} {hi:%b %Y}"
+
+
+DEFAULT_PERIOD = default_period_text()
+
+
+def update_period_from_data():
+    """Callback to update the period text BEFORE the widget re-renders."""
+    if "df_cache" in st.session_state and st.session_state.df_cache is not None:
+        df = st.session_state.df_cache
+        data_period = period_from_dates(df["BillDate"])
+        # Only auto-override if the user hasn't manually typed a custom period
+        if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
+            st.session_state["period_text_input"] = data_period
+
+
 ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
 XL_THRESHOLD   = 20
-EXPECTED_TOTAL = 172400  # set to 0 to disable
 
 # ---------- statement styling ----------
 FONT_TITLE   = Font(name="Calibri", size=14, bold=True)
@@ -63,11 +82,12 @@ LONG_TEST_CHARS = 25
 _SPACE_RE = re.compile(r"\s+")
 _PUNCT_RE = re.compile(r"[.,]+$")
 
+
 def normalize_referrer(name):
     s = str(name).strip()
     s = _SPACE_RE.sub(" ", s)
     s = _PUNCT_RE.sub("", s)
-    return s.upper()          # ← ALL CAPS
+    return s.upper()
 
 
 def is_html_bytes(b):
@@ -94,11 +114,6 @@ def parse_date(v):
         return pd.to_datetime(v, dayfirst=True)
     except Exception:
         return None
-
-
-def fmt_date(v):
-    d = parse_date(v)
-    return d.strftime("%d/%m/%Y") if d is not None else str(v)
 
 
 def compute_rate(cut, disc, amb):
@@ -156,6 +171,10 @@ def load_source(raw_bytes, filename="file.xls"):
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
 
+    # Capture the original Rate column before dropping it, so we can audit it later
+    if "Rate" in df.columns:
+        df["_orig_file_rate"] = df["Rate"].apply(clean_money)
+        
     for c in ["Rate", "Profit"]:
         if c in df.columns:
             df = df.drop(columns=[c])
@@ -264,53 +283,51 @@ def pack_referrers(ref_groups):
     return sheets
 
 
-# ------------------------------------------------------------------
-# INDEX — 3 side-by-side tables in portrait, bigger fonts
-# ------------------------------------------------------------------
 def write_index(ws, ref_groups, sheet_map, period_text):
-    """Three stacked-column tables: col-blocks (A-D), (F-I), (K-N)."""
     FONT_IDX_TITLE  = Font(name="Calibri", size=14, bold=True)
-    FONT_IDX_HEADER = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
-    FONT_IDX_BODY   = Font(name="Calibri", size=10)
-    FONT_IDX_TOTAL  = Font(name="Calibri", size=10, bold=True)
-    FONT_IDX_LINK   = Font(name="Calibri", size=10, color="0563C1", underline="single")
+    FONT_IDX_HEADER = Font(name="Calibri", size=9, bold=True, color="FFFFFF")
+    FONT_IDX_BODY   = Font(name="Calibri", size=9)
+    FONT_IDX_TOTAL  = Font(name="Calibri", size=9, bold=True)
+    FONT_IDX_LINK   = Font(name="Calibri", size=9, color="0563C1", underline="single")
+
+    IDX_HEADERS = ["Referrer", "Lines", "Rate (₹)",
+                   "S/A", "F/NF", "D/ND", "ONLINE", "Go"]
 
     ws["A1"] = f"Commission Report Index — {period_text}"
     ws["A1"].font = FONT_IDX_TITLE
-    ws.merge_cells("A1:N1")
+    ws.merge_cells("A1:Q1")
     ws.row_dimensions[1].height = 20
 
-    table_starts = [1, 6, 11]
-    col_widths = {
-        1: 26, 2: 7, 3: 11, 4: 5,
-        5: 2,
-        6: 26, 7: 7, 8: 11, 9: 5,
-        10: 2,
-        11: 26, 12: 7, 13: 11, 14: 5,
-    }
+    table_starts = [1, 10]
+
+    block_widths = [26, 7, 11, 6, 7, 7, 9, 5]
+    col_widths = {}
+    for start in table_starts:
+        for off, w in enumerate(block_widths):
+            col_widths[start + off] = w
+    col_widths[9] = 2
     for c, w in col_widths.items():
         ws.column_dimensions[get_column_letter(c)].width = w
 
     n = len(ref_groups)
-    per_col = (n + 2) // 3
+    per_col = (n + 1) // 2
     columns = [ref_groups[0:per_col],
-               ref_groups[per_col:2*per_col],
-               ref_groups[2*per_col:3*per_col]]
+               ref_groups[per_col:2*per_col]]
 
     header_row = 2
-    start_row = 3
+    start_row  = 3
 
     grand_total = 0.0
     grand_items = 0
 
-    for tbl_idx, (start_col, group) in enumerate(zip(table_starts, columns)):
-        for i, h in enumerate(["Referrer", "Lines", "Rate (₹)", "Go"]):
+    for start_col, group in zip(table_starts, columns):
+        for i, h in enumerate(IDX_HEADERS):
             c = ws.cell(row=header_row, column=start_col + i, value=h)
             c.font = FONT_IDX_HEADER
             c.fill = FILL_HEADER
             c.alignment = CENTER
             c.border = BORDER
-        ws.row_dimensions[header_row].height = 15
+        ws.row_dimensions[header_row].height = 14
 
         r = start_row
         for name, g in group:
@@ -326,11 +343,15 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = RIGHT
             c.number_format = "#,##0"
 
-            link = ws.cell(row=r, column=start_col + 3, value="►")
+            for i in range(3, 7):
+                c = ws.cell(row=r, column=start_col + i, value=None)
+                c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = CENTER
+
+            link = ws.cell(row=r, column=start_col + 7, value="►")
             link.hyperlink = f"#'{sn}'!A{fr}"
             link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
 
-            ws.row_dimensions[r].height = 14
+            ws.row_dimensions[r].height = 11
             grand_total += float(g["Rate"].sum())
             grand_items += len(g)
             r += 1
@@ -350,21 +371,22 @@ def write_index(ws, ref_groups, sheet_map, period_text):
         c.border = BORDER; c.alignment = RIGHT
         c.number_format = "#,##0"
 
-        c = ws.cell(row=r, column=start_col + 3)
-        c.fill = FILL_TOTAL; c.border = BORDER
+        for i in range(3, 8):
+            c = ws.cell(row=r, column=start_col + i)
+            c.fill = FILL_TOTAL; c.border = BORDER
 
     last_row = start_row + per_col + 1
     ws.cell(row=last_row + 1, column=1, value="GRAND TOTAL")
     ws.cell(row=last_row + 1, column=2, value=grand_items)
     c = ws.cell(row=last_row + 1, column=3, value=grand_total)
     c.number_format = "#,##0"
-    for j in range(1, 5):
+    for j in range(1, 9):
         cc = ws.cell(row=last_row + 1, column=j)
         cc.font = FONT_IDX_TOTAL
         cc.fill = FILL_TOTAL
         cc.border = BORDER
-        cc.alignment = CENTER if j in (2, 4) else (LEFT if j == 1 else RIGHT)
-    ws.row_dimensions[last_row + 1].height = 16
+        cc.alignment = CENTER if j in (2, 4, 5, 6, 7, 8) else (LEFT if j == 1 else RIGHT)
+    ws.row_dimensions[last_row + 1].height = 14
 
     ws.freeze_panes = "A3"
 
@@ -375,10 +397,10 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_margins.left = 0.35
     ws.page_margins.right = 0.35
-    ws.page_margins.top = 0.5
-    ws.page_margins.bottom = 0.5
+    ws.page_margins.top = 0.4
+    ws.page_margins.bottom = 0.4
     ws.print_options.horizontalCentered = True
-    ws.print_area = f"A1:N{last_row + 1}"
+    ws.print_area = f"A1:Q{last_row + 1}"
 
 
 def write_block(ws, start_row, referrer, df, period_text):
@@ -457,7 +479,7 @@ def write_block(ws, start_row, referrer, df, period_text):
 
     ws.cell(row=r, column=1, value="Thanks & Regards")
     ws.cell(row=r, column=1).font = FONT_THANKS
-    r += 1   # ← was 2; saves a row per block for tighter print packing
+    r += 1
 
     return r, header_row
 
@@ -473,11 +495,10 @@ def build_workbook(df, ref_groups, packed, period_text):
         for i, w in enumerate(COL_WIDTHS, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
 
-        # --- page setup: pack as many blocks per printed page as fit ---
         ws.page_setup.orientation = "portrait"
         ws.page_setup.paperSize   = ws.PAPERSIZE_A4
-        ws.page_setup.fitToWidth  = 1     # always fit the 9 cols to 1 page wide
-        ws.page_setup.fitToHeight = 0     # as many pages tall as needed
+        ws.page_setup.fitToWidth  = 1
+        ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
         ws.print_options.horizontalCentered = True
         ws.page_margins.left   = 0.3
@@ -485,16 +506,11 @@ def build_workbook(df, ref_groups, packed, period_text):
         ws.page_margins.top    = 0.4
         ws.page_margins.bottom = 0.4
 
-        # Repeat header rows ONLY for single-referrer sheets (multi-page
-        # statements keep the header on every page). For multi-referrer
-        # sheets, each block carries its own header, so don't repeat.
         if len(group) == 1:
             ws.print_title_rows = "1:3"
 
         row = 1
         for referrer, g in group:
-            # NO manual row breaks — let Excel flow blocks naturally and
-            # pack as many per page as legibly fit.
             row, hr = write_block(ws, row, referrer, g, period_text)
             sheet_map[referrer] = (sn, hr - 2)
 
@@ -503,10 +519,8 @@ def build_workbook(df, ref_groups, packed, period_text):
 
 
 def build_individual_workbook(referrer, df_one, period_text):
-    """Single-sheet workbook: one referrer's statement, sheet named after the referrer."""
     wb = Workbook()
     ws = wb.active
-    # Excel sheet-name limit: 31 chars, no []:*?/\
     safe_name = re.sub(r"[\[\]:*?/\\]", "-", str(referrer))[:31]
     ws.title = safe_name or "Statement"
 
@@ -540,23 +554,22 @@ st.title("📊 Commission Report Builder")
 st.caption("Load your flat Excel file (.xls / .xlsx / HTML-exported .xls) "
            "from an upload or a Google Drive / Sheets link.")
 
-# --- non-widget session state ---
 if "raw_bytes"   not in st.session_state: st.session_state.raw_bytes   = None
 if "source_name" not in st.session_state: st.session_state.source_name = "source.xls"
 if "report_buf"  not in st.session_state: st.session_state.report_buf  = None
 if "summary"     not in st.session_state: st.session_state.summary     = None
 if "df_cache"    not in st.session_state: st.session_state.df_cache    = None
 
-period_text = st.text_input("Report period", value=DEFAULT_PERIOD,
-                            key="period_text_input")
+if "period_text_input" not in st.session_state:
+    st.session_state["period_text_input"] = default_period_text()
+
+period_text = st.text_input("Report period", key="period_text_input")
 
 st.subheader("Option 1 — Upload")
 uploaded = st.file_uploader("Choose your Excel file",
                             type=["xls", "xlsx", "html", "htm"],
                             key="file_uploader_widget")
 if uploaded is not None:
-    # Only re-read if the file identity actually changed — prevents
-    # df_cache from being wiped on every rerun.
     new_bytes = uploaded.read()
     if new_bytes != st.session_state.raw_bytes:
         st.session_state.raw_bytes   = new_bytes
@@ -588,11 +601,23 @@ if st.button("Fetch from Drive", key="fetch_drive_btn"):
 if st.session_state.raw_bytes is not None:
     st.info(f"Loaded file: {st.session_state.source_name} "
             f"({len(st.session_state.raw_bytes):,} bytes)")
-    if st.button("Generate Report", type="primary", key="generate_report_btn"):
+    if st.button("Generate Report", type="primary", key="generate_report_btn", on_click=update_period_from_data):
         with st.spinner("Building report…"):
             try:
-                df = load_source(st.session_state.raw_bytes,
-                                 st.session_state.source_name)
+                raw_bytes = st.session_state.raw_bytes
+                if is_html_bytes(raw_bytes):
+                    tables = pd.read_html(io.BytesIO(raw_bytes))
+                    raw_df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+                else:
+                    engine = "xlrd" if st.session_state.source_name.lower().endswith(".xls") else "openpyxl"
+                    try:
+                        raw_df = pd.read_excel(io.BytesIO(raw_bytes), engine=engine)
+                    except Exception:
+                        alt = "openpyxl" if engine == "xlrd" else "xlrd"
+                        raw_df = pd.read_excel(io.BytesIO(raw_bytes), engine=alt)
+
+                raw_df.columns = [str(c).strip() for c in raw_df.columns]
+                df = load_source(raw_bytes, st.session_state.source_name)
             except Exception as e:
                 st.error(f"Could not read file: {e}")
                 st.stop()
@@ -600,6 +625,8 @@ if st.session_state.raw_bytes is not None:
             if df.empty:
                 st.warning("No rows found after cleaning. Check your file.")
                 st.stop()
+
+            period_text = st.session_state["period_text_input"]
 
             ref_groups = sorted(
                 df.groupby("ReferBy", sort=False),
@@ -621,13 +648,37 @@ if st.session_state.raw_bytes is not None:
 
             computed_total = float(df["Rate"].sum())
 
+            # Anomaly detection: compare source Rate to calculated Rate using a unique key
+            anomalies = []
+            if "_orig_file_rate" in df.columns:
+                df_audit = df.copy()
+                
+                # Find mathematically different rates
+                diff_mask = (df_audit["_orig_file_rate"] - df_audit["Rate"]).abs() > 0.01
+                
+                if diff_mask.any():
+                    anomaly_df = df_audit[diff_mask].copy()
+                    anomaly_df = anomaly_df.rename(columns={
+                        "_orig_file_rate": "File_Rate",
+                        "Rate": "App_Rate",
+                        "ReferBy": "Referrer"
+                    })
+                    anomalies = anomaly_df[
+                        ["Referrer", "BillDate", "PatientName", "TestName", 
+                         "CutRate", "DiscPercent", "File_Rate", "App_Rate"]
+                    ].to_dict("records")
+                    
+                # Clean up the helper column so it doesn't show in the app UI
+                df = df.drop(columns=["_orig_file_rate"])
+
             st.session_state.report_buf = buf.getvalue()
             st.session_state.df_cache   = df
             st.session_state.summary = {
                 "rows": int(len(df)),
                 "referrers": int(df["ReferBy"].nunique()),
                 "total_rate": computed_total,
-                "expected": EXPECTED_TOTAL,
+                "period": period_text,
+                "anomalies": anomalies,
                 "top": [
                     (n, len(g), float(g["Rate"].sum()))
                     for n, g in ref_groups[:15]
@@ -635,19 +686,19 @@ if st.session_state.raw_bytes is not None:
             }
             st.session_state.pop("_referrer_dataset_id", None)
 
-# ---------------- combined report download ----------------
 if st.session_state.report_buf is not None:
     s = st.session_state.summary
-    st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers.")
+    st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers "
+               f"— period **{s.get('period', period_text)}**.")
     st.metric("Computed total Rate (₹)", f"{s['total_rate']:,.0f}")
 
-    if s.get("expected"):
-        diff = s["total_rate"] - s["expected"]
-        if abs(diff) < 1:
-            st.info(f"✔ Total matches source TOTAL row (₹{s['expected']:,}).")
-        else:
-            st.warning(f"⚠️ Computed total differs from source TOTAL "
-                       f"(₹{s['expected']:,}) by ₹{diff:+,.0f}.")
+    if s.get("anomalies"):
+        st.error(f"⚠️ **Calculation Anomaly Detected!** The app found "
+                 f"**{len(s['anomalies'])}** rows where the source file's "
+                 f"Rate differs from our calculated Rate.")
+        with st.expander("🔍 View Anomaly Rows", expanded=True):
+            st.dataframe(pd.DataFrame(s["anomalies"]),
+                         use_container_width=True, hide_index=True)
 
     st.download_button(
         label="⬇️ Download combined report (.xlsx)",
@@ -665,7 +716,6 @@ if st.session_state.report_buf is not None:
         })
         st.dataframe(preview, hide_index=True, use_container_width=True)
 
-# ---------------- ambulance audit ----------------
 if st.session_state.df_cache is not None:
     st.divider()
     with st.expander("🚑 Ambulance Audit — verify what's in the source file",
@@ -724,7 +774,6 @@ if st.session_state.df_cache is not None:
     if not referrer_list:
         st.warning("No referrers available in the loaded data.")
     else:
-        # Stable dataset fingerprint — only (source_name, len(df)).
         dataset_id = (
             st.session_state.get("source_name", ""),
             int(len(df)),
@@ -761,7 +810,7 @@ if st.session_state.df_cache is not None:
                 if df_one.empty:
                     st.warning(f"No rows found for {selected}.")
                 else:
-                    amb_rows = int((df_one["Ambulance"] > 0).sum())
+                    amb_rows  = int((df_one["Ambulance"] > 0).sum())
                     amb_total = float(df_one["Ambulance"].sum())
 
                     col1, col2, col3, col4 = st.columns(4)
@@ -783,7 +832,11 @@ if st.session_state.df_cache is not None:
                             use_container_width=True,
                         )
 
-                    wb_one = build_individual_workbook(selected, df_one, period_text)
+                    wb_one = build_individual_workbook(
+                        selected,
+                        df_one,
+                        st.session_state["period_text_input"],
+                    )
                     buf_one = io.BytesIO()
                     wb_one.save(buf_one)
                     buf_one.seek(0)
