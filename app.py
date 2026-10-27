@@ -660,11 +660,12 @@ if st.session_state.raw_bytes is not None:
                     anomaly_df = df_audit[diff_mask].copy()
                     anomaly_df = anomaly_df.rename(columns={
                         "_orig_file_rate": "File_Rate",
-                        "Rate": "App_Rate"
+                        "Rate": "App_Rate",
+                        "ReferBy": "Referrer"
                     })
                     anomalies = anomaly_df[
-                        ["BillDate", "PatientName", "TestName", 
-                         "CutRate", "File_Rate", "App_Rate"]
+                        ["Referrer", "BillDate", "PatientName", "TestName", 
+                         "CutRate", "DiscPercent", "File_Rate", "App_Rate"]
                     ].to_dict("records")
                     
                 # Clean up the helper column so it doesn't show in the app UI
