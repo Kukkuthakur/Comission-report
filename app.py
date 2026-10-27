@@ -36,6 +36,17 @@ def period_from_dates(date_strings):
 
 DEFAULT_PERIOD = default_period_text()
 
+
+def update_period_from_data():
+    """Callback to update the period text BEFORE the widget re-renders."""
+    if "df_cache" in st.session_state and st.session_state.df_cache is not None:
+        df = st.session_state.df_cache
+        data_period = period_from_dates(df["BillDate"])
+        # Only auto-override if the user hasn't manually typed a custom period
+        if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
+            st.session_state["period_text_input"] = data_period
+
+
 ROWS_PER_PAGE  = 38
 BLOCK_OVERHEAD = 6
 XL_THRESHOLD   = 20
@@ -586,7 +597,7 @@ if st.button("Fetch from Drive", key="fetch_drive_btn"):
 if st.session_state.raw_bytes is not None:
     st.info(f"Loaded file: {st.session_state.source_name} "
             f"({len(st.session_state.raw_bytes):,} bytes)")
-    if st.button("Generate Report", type="primary", key="generate_report_btn"):
+    if st.button("Generate Report", type="primary", key="generate_report_btn", on_click=update_period_from_data):
         with st.spinner("Building report…"):
             try:
                 raw_bytes = st.session_state.raw_bytes
@@ -611,10 +622,6 @@ if st.session_state.raw_bytes is not None:
                 st.warning("No rows found after cleaning. Check your file.")
                 st.stop()
 
-            # Auto-update period text from actual data dates
-            data_period = period_from_dates(df["BillDate"])
-            if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
-                st.session_state["period_text_input"] = data_period
             period_text = st.session_state["period_text_input"]
 
             ref_groups = sorted(
