@@ -751,6 +751,7 @@ if st.session_state.df_cache is not None:
                 hide_index=True,
             )
 
+# ---------------- individual referrer download ----------------
 if st.session_state.df_cache is not None:
     st.divider()
     st.subheader("Individual Referrer Statement")
@@ -784,4 +785,60 @@ if st.session_state.df_cache is not None:
             st.warning("No referrer matches your search.")
         else:
             current = st.session_state.get("referrer_pick")
-            idx = filtered.index(current) if
+            idx = filtered.index(current) if current in filtered else 0
+
+            selected = st.selectbox(
+                "Select referrer",
+                options=filtered,
+                index=idx,
+                key="referrer_pick",
+            )
+
+            if selected:
+                df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
+
+                if df_one.empty:
+                    st.warning(f"No rows found for {selected}.")
+                else:
+                    amb_rows  = int((df_one["Ambulance"] > 0).sum())
+                    amb_total = float(df_one["Ambulance"].sum())
+
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Line items", f"{len(df_one):,}")
+                    with col2:
+                        st.metric("Total Rate (₹)", f"{df_one['Rate'].sum():,.0f}")
+                    with col3:
+                        st.metric("Ambulance rows", f"{amb_rows:,}")
+                    with col4:
+                        st.metric("Ambulance ₹", f"{amb_total:,.0f}")
+
+                    with st.expander("Preview rows"):
+                        st.dataframe(
+                            df_one[["BillDate", "PatientName", "TestName",
+                                    "PatientRate", "Ambulance",
+                                    "DiscPercent", "CutRate", "Rate"]],
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+
+                    wb_one = build_individual_workbook(
+                        selected,
+                        df_one,
+                        st.session_state["period_text_input"],
+                    )
+                    buf_one = io.BytesIO()
+                    wb_one.save(buf_one)
+                    buf_one.seek(0)
+
+                    safe_fname = re.sub(r"[^A-Za-z0-9._-]", "_", selected)[:60]
+                    st.download_button(
+                        label=f"⬇️ Download statement for {selected} (.xlsx)",
+                        data=buf_one.getvalue(),
+                        file_name=f"{safe_fname}_Commission_Statement.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_individual_{safe_fname}",
+                    )
+
+st.divider()
+st.caption("Rate = PercentCut − Disc − Ambulance (ambulance only when 100), floored at 0.")
