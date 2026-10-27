@@ -89,7 +89,6 @@ def clean_money(v):
         return 0.0
     if isinstance(v, (int, float)):
         return float(v)
-    # Strip all non-numeric characters except dots and minus signs
     s = re.sub(r"[^\d.\-]", "", str(v))
     try:
         return float(s) if s not in ("", "-", ".") else 0.0
@@ -133,6 +132,13 @@ def load_source(raw_bytes, filename="file.xls"):
 
     df.columns = [str(c).strip() for c in df.columns]
 
+    # Keep the original "Rate" column from the file to check for anomalies
+    original_rate_col = None
+    for c in df.columns:
+        if str(c).strip().upper() in ["RATE", "COMMISSION"]:
+            original_rate_col = c
+            break
+            
     aliases = {
         "RefNo":       ["RefNo", "Ref No", "Reference"],
         "PatientName": ["PatientName", "Patient Name"],
@@ -161,8 +167,9 @@ def load_source(raw_bytes, filename="file.xls"):
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
 
-    for c in ["Rate", "Profit"]:
-        if c in df.columns:
+    # Remove original Rate and Profit so our calculate engine can take over
+    for c in ["Rate", "Profit", original_rate_col]:
+        if c in df.columns and c is not None:
             df = df.drop(columns=[c])
 
     referby_str = df["ReferBy"].astype(str).str.strip().str.upper()
@@ -270,10 +277,6 @@ def pack_referrers(ref_groups):
 
 
 def write_index(ws, ref_groups, sheet_map, period_text):
-    """
-    Two side-by-side tables forced onto 1 single printed page.
-    Font and row heights tightened so 165+ referrers fit.
-    """
     FONT_IDX_TITLE  = Font(name="Calibri", size=14, bold=True)
     FONT_IDX_HEADER = Font(name="Calibri", size=9, bold=True, color="FFFFFF")
     FONT_IDX_BODY   = Font(name="Calibri", size=9)
@@ -288,7 +291,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
     ws.merge_cells("A1:Q1")
     ws.row_dimensions[1].height = 20
 
-    table_starts = [1, 10]          # A (1) and J (10); col I (9) is spacer
+    table_starts = [1, 10]
 
     block_widths = [26, 7, 11, 6, 7, 7, 9, 5]
     col_widths = {}
@@ -333,7 +336,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = RIGHT
             c.number_format = "#,##0"
 
-            for i in range(3, 7):                        # S/A, F/NF, D/ND, ONLINE
+            for i in range(3, 7):
                 c = ws.cell(row=r, column=start_col + i, value=None)
                 c.font = FONT_IDX_BODY; c.border = BORDER; c.alignment = CENTER
 
@@ -341,7 +344,7 @@ def write_index(ws, ref_groups, sheet_map, period_text):
             link.hyperlink = f"#'{sn}'!A{fr}"
             link.font = FONT_IDX_LINK; link.border = BORDER; link.alignment = CENTER
 
-            ws.row_dimensions[r].height = 11  # Tighter row height to guarantee 1 page
+            ws.row_dimensions[r].height = 11  
             grand_total += float(g["Rate"].sum())
             grand_items += len(g)
             r += 1
@@ -594,8 +597,22 @@ if st.session_state.raw_bytes is not None:
     if st.button("Generate Report", type="primary", key="generate_report_btn"):
         with st.spinner("Building report…"):
             try:
-                df = load_source(st.session_state.raw_bytes,
-                                 st.session_state.source_name)
+                # Pre-parse raw dataframe to capture anomalies and true dates
+                raw_bytes = st.session_state.raw_bytes
+                if is_html_bytes(raw_bytes):
+                    tables = pd.read_html(io.BytesIO(raw_bytes))
+                    raw_df = max(tables, key=lambda t: t.shape[0] * t.shape[1])
+                else:
+                    engine = "xlrd" if st.session_state.source_name.lower().endswith(".xls") else "openpyxl"
+                    try:
+                        raw_df = pd.read_excel(io.BytesIO(raw_bytes), engine=engine)
+                    except Exception:
+                        alt = "openpyxl" if engine == "xlrd" else "xlrd"
+                        raw_df = pd.read_excel(io.BytesIO(raw_bytes), engine=alt)
+                
+                raw_df.columns = [str(c).strip() for c in raw_df.columns]
+                
+                df = load_source(raw_bytes, st.session_state.source_name)
             except Exception as e:
                 st.error(f"Could not read file: {e}")
                 st.stop()
@@ -604,12 +621,12 @@ if st.session_state.raw_bytes is not None:
                 st.warning("No rows found after cleaning. Check your file.")
                 st.stop()
 
+            # --- PERIOD TEXT FIX ---
+            # Automatically grab the date range from the file and override the label
             data_period = period_from_dates(df["BillDate"])
             if st.session_state.get("period_text_input") in ("", DEFAULT_PERIOD):
                 st.session_state["period_text_input"] = data_period
-                period_text = data_period
-            else:
-                period_text = st.session_state["period_text_input"]
+            period_text = st.session_state["period_text_input"]
 
             ref_groups = sorted(
                 df.groupby("ReferBy", sort=False),
@@ -630,6 +647,28 @@ if st.session_state.raw_bytes is not None:
             buf.seek(0)
 
             computed_total = float(df["Rate"].sum())
+            
+            # --- ANOMALY DETECTION FIX ---
+            # Look for the original Rate column in the raw file to compare against our math
+            source_rate_col = next((c for c in raw_df.columns if str(c).strip().upper() == "RATE"), None)
+            anomalies = []
+            
+            if source_rate_col:
+                # Clean original rates
+                clean_raw_rate = raw_df[source_rate_col].apply(clean_money)
+                clean_calc_rate = df["Rate"]
+                
+                # Align lengths
+                min_len = min(len(clean_raw_rate), len(clean_calc_rate))
+                diff = clean_raw_rate.iloc[:min_len] - clean_calc_rate.iloc[:min_len]
+                
+                # Find rows where difference is not 0
+                diff_mask = diff.abs() > 0.01
+                if diff_mask.any():
+                    anomaly_df = df.iloc[:min_len][diff_mask].copy()
+                    anomaly_df["File_Rate"] = clean_raw_rate.iloc[:min_len][diff_mask]
+                    anomaly_df["App_Rate"] = clean_calc_rate.iloc[:min_len][diff_mask]
+                    anomalies = anomaly_df[["BillDate", "PatientName", "TestName", "CutRate", "File_Rate", "App_Rate"]].to_dict('records')
 
             st.session_state.report_buf = buf.getvalue()
             st.session_state.df_cache   = df
@@ -638,6 +677,7 @@ if st.session_state.raw_bytes is not None:
                 "referrers": int(df["ReferBy"].nunique()),
                 "total_rate": computed_total,
                 "period": period_text,
+                "anomalies": anomalies,
                 "top": [
                     (n, len(g), float(g["Rate"].sum()))
                     for n, g in ref_groups[:15]
@@ -650,6 +690,12 @@ if st.session_state.report_buf is not None:
     st.success(f"✅ Loaded **{s['rows']}** rows across **{s['referrers']}** referrers "
                f"— period **{s.get('period', period_text)}**.")
     st.metric("Computed total Rate (₹)", f"{s['total_rate']:,.0f}")
+
+    # Show Anomaly Warning if any found
+    if s.get("anomalies"):
+        st.error(f"⚠️ **Calculation Anomaly Detected!** The app found {len(s['anomalies'])} rows where the source file's Rate differs from our calculated Rate. Check the raw 'Percent Cut' data.")
+        with st.expander("🔍 View Anomaly Rows"):
+            st.dataframe(pd.DataFrame(s["anomalies"]), use_container_width=True)
 
     st.download_button(
         label="⬇️ Download combined report (.xlsx)",
@@ -704,58 +750,4 @@ if st.session_state.df_cache is not None:
             st.write("**Every ambulance row in the file:**")
             show_cols = [c for c in
                          ["RefNo", "PatientName", "ReferBy", "BillDate",
-                          "TestName", "Ambulance"]
-                         if c in amb_df.columns]
-            st.dataframe(
-                amb_df[show_cols].reset_index(drop=True),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-if st.session_state.df_cache is not None:
-    st.divider()
-    st.subheader("Individual Referrer Statement")
-    st.caption("Pick a referrer to download a single-sheet XLSX containing only "
-               "that referrer's statement, in the same layout as the combined report.")
-
-    df = st.session_state.df_cache
-    referrer_list = sorted(df["ReferBy"].unique().tolist())
-
-    if not referrer_list:
-        st.warning("No referrers available in the loaded data.")
-    else:
-        dataset_id = (
-            st.session_state.get("source_name", ""),
-            int(len(df)),
-        )
-
-        if st.session_state.get("_referrer_dataset_id") != dataset_id:
-            st.session_state.pop("referrer_pick", None)
-            st.session_state.pop("referrer_search_query", None)
-            st.session_state["_referrer_dataset_id"] = dataset_id
-
-        query = st.text_input(
-            "Search referrer (optional)",
-            key="referrer_search_query",
-        ).strip().upper()
-
-        filtered = [r for r in referrer_list if query in r] if query else referrer_list
-
-        if not filtered:
-            st.warning("No referrer matches your search.")
-        else:
-            current = st.session_state.get("referrer_pick")
-            idx = filtered.index(current) if current in filtered else 0
-
-            selected = st.selectbox(
-                "Select referrer",
-                options=filtered,
-                index=idx,
-                key="referrer_pick",
-            )
-
-            if selected:
-                df_one = df[df["ReferBy"] == selected].reset_index(drop=True)
-
-                if df_one.empty:
-                    st.w
+                          "TestName", "Ambulance
